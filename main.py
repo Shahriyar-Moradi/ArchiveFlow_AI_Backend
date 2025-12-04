@@ -27,6 +27,8 @@ from urllib.parse import unquote
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Body, Form, Depends, status, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Message
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -256,16 +258,28 @@ security = HTTPBearer()
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get current user from JWT token"""
-    token = credentials.credentials
-    result = simple_auth.get_user(token)
-    
-    if not result["success"]:
+    try:
+        token = credentials.credentials
+        result = simple_auth.get_user(token)
+        
+        if not result["success"]:
+            # Raise HTTPException which will be caught by exception handler with CORS headers
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=result["error"],
+            )
+        
+        return result["user"]
+    except HTTPException:
+        # Re-raise HTTPException (will be handled by exception handler with CORS)
+        raise
+    except Exception as e:
+        # Catch any other exceptions and wrap in HTTPException with CORS
+        logger.error(f"Authentication error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=result["error"],
+            detail="Authentication failed",
         )
-    
-    return result["user"]
 
 def is_admin_user(user: Dict[str, Any] = Depends(get_current_user)) -> bool:
     """Check if current user is admin"""
@@ -390,6 +404,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Response middleware to ensure CORS headers are always present
+class CORSResponseMiddleware(BaseHTTPMiddleware):
+    """Middleware to ensure CORS headers are added to all responses, including errors"""
+    async def dispatch(self, request: Request, call_next):
+        # Get the origin from the request
+        origin = request.headers.get("origin")
+        
+        # Process the request
+        response = await call_next(request)
+        
+        # Add CORS headers to all responses
+        if origin and origin in allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        elif not origin:
+            # If no origin header, allow all (for non-browser clients)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        else:
+            # Even if origin is not in allowed_origins, add headers for error responses
+            # This ensures CORS errors don't mask the actual error
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        
+        # Add other CORS headers
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = "*"
+        
+        # Handle OPTIONS preflight requests
+        if request.method == "OPTIONS":
+            response.headers["Access-Control-Max-Age"] = "3600"
+        
+        return response
+
+app.add_middleware(CORSResponseMiddleware)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -411,6 +461,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     elif not origin:
         # If no origin header, allow all (for non-browser clients)
         cors_headers["Access-Control-Allow-Origin"] = "*"
+    else:
+        # Even if origin is not in allowed_origins, add headers for error responses
+        # This ensures CORS errors don't mask the actual error (especially for 503)
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    
+    # Add other CORS headers
+    cors_headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    cors_headers["Access-Control-Allow-Headers"] = "*"
+    cors_headers["Access-Control-Expose-Headers"] = "*"
+    
+    # Log 503 errors for debugging
+    if exc.status_code == 503:
+        logger.error(f"503 Service Unavailable: {exc.detail} (origin: {origin})")
     
     # Return error response with CORS headers
     return JSONResponse(
@@ -433,9 +497,18 @@ async def global_exception_handler(request: Request, exc: Exception):
     elif not origin:
         # If no origin header, allow all (for non-browser clients)
         cors_headers["Access-Control-Allow-Origin"] = "*"
+    else:
+        # Even if origin is not in allowed_origins, add headers for error responses
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    
+    # Add other CORS headers
+    cors_headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    cors_headers["Access-Control-Allow-Headers"] = "*"
+    cors_headers["Access-Control-Expose-Headers"] = "*"
     
     # Log the error for debugging
-    logger.error(f"Unhandled exception: {type(exc).__name__}: {str(exc)}", exc_info=True)
+    logger.error(f"Unhandled exception: {type(exc).__name__}: {str(exc)} (origin: {origin})", exc_info=True)
     
     # Return error response with CORS headers
     return JSONResponse(
@@ -950,6 +1023,28 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
     return result
 
 # API Routes
+
+@app.options("/{full_path:path}")
+async def options_handler(request: Request, full_path: str):
+    """Handle OPTIONS preflight requests for all routes"""
+    origin = request.headers.get("origin")
+    
+    cors_headers = {}
+    if origin and origin in allowed_origins:
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    elif not origin:
+        cors_headers["Access-Control-Allow-Origin"] = "*"
+    else:
+        # Even if origin is not in allowed_origins, respond to preflight
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    
+    cors_headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
+    cors_headers["Access-Control-Allow-Headers"] = "*"
+    cors_headers["Access-Control-Max-Age"] = "3600"
+    
+    return Response(status_code=204, headers=cors_headers)
 
 @app.get("/")
 async def root():
