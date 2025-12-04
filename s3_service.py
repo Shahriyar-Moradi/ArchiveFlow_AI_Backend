@@ -103,54 +103,54 @@ def _get_gcs_client():
     try:
         # Priority 1: Use GOOGLE_APPLICATION_CREDENTIALS if set (production pattern)
         if key_path and os.path.exists(key_path):
+            # Verify JSON file contains private_key before loading
+            try:
+                import json
+                with open(key_path, 'r') as f:
+                    key_data = json.load(f)
+                    if not key_data.get('private_key'):
+                        logger.warning(f"⚠️  Key file {key_path} does not contain private_key field")
+                        supports_signing = False
+                    else:
+                        supports_signing = True
+            except Exception as e:
+                logger.warning(f"⚠️  Could not verify key file structure: {e}, assuming valid")
+                supports_signing = True  # Trust the file if we can't verify
+            
             # Use from_service_account_json for cleaner initialization
             client = storage.Client.from_service_account_json(
                 key_path,
                 project=project_id
             )
             key_file_used = key_path
-            # If we successfully loaded from JSON, it MUST have a private key
-            # Service account JSON keys always include private_key for signing
-            supports_signing = True
-            # Try to verify, but don't fail if we can't access credentials directly
-            try:
-                if hasattr(client, '_credentials'):
-                    creds = client._credentials
-                    # Double-check if we can verify the private key exists
-                    if creds and hasattr(creds, 'private_key'):
-                        if not creds.private_key:
-                            logger.warning(f"⚠️  Loaded credentials from {key_path} but private_key is empty")
-                            supports_signing = False
-            except Exception as e:
-                # If we can't verify, trust that JSON loading worked
-                logger.debug(f"Could not verify credentials directly: {e}, assuming signing is supported")
+            # If we successfully loaded from JSON and verified it has private_key, it supports signing
             logger.info(f"✅ GCS client initialized with service account key: {key_path} (signing: {supports_signing})")
             return client, supports_signing, key_file_used
 
         # Priority 2: Try local service account key file
         fallback_key = os.path.join(os.path.dirname(__file__), "voucher-storage-key.json")
         if os.path.exists(fallback_key):
+            # Verify JSON file contains private_key before loading
+            try:
+                import json
+                with open(fallback_key, 'r') as f:
+                    key_data = json.load(f)
+                    if not key_data.get('private_key'):
+                        logger.warning(f"⚠️  Key file {fallback_key} does not contain private_key field")
+                        supports_signing = False
+                    else:
+                        supports_signing = True
+            except Exception as e:
+                logger.warning(f"⚠️  Could not verify key file structure: {e}, assuming valid")
+                supports_signing = True  # Trust the file if we can't verify
+            
             # Use from_service_account_json for cleaner initialization
             client = storage.Client.from_service_account_json(
                 fallback_key,
                 project=project_id
             )
             key_file_used = fallback_key
-            # If we successfully loaded from JSON, it MUST have a private key
-            # Service account JSON keys always include private_key for signing
-            supports_signing = True
-            # Try to verify, but don't fail if we can't access credentials directly
-            try:
-                if hasattr(client, '_credentials'):
-                    creds = client._credentials
-                    # Double-check if we can verify the private key exists
-                    if creds and hasattr(creds, 'private_key'):
-                        if not creds.private_key:
-                            logger.warning(f"⚠️  Loaded credentials from {fallback_key} but private_key is empty")
-                            supports_signing = False
-            except Exception as e:
-                # If we can't verify, trust that JSON loading worked
-                logger.debug(f"Could not verify credentials directly: {e}, assuming signing is supported")
+            # If we successfully loaded from JSON and verified it has private_key, it supports signing
             logger.info(f"✅ GCS client initialized with service account key: {fallback_key} (signing: {supports_signing})")
             return client, supports_signing, key_file_used
 
@@ -669,11 +669,18 @@ class S3Service:
             # Check if credentials support signing before attempting
             if not self._supports_signing:
                 key_exists, key_path = _check_key_file_exists()
+                current_file_dir = os.path.dirname(__file__)
+                expected_fallback = os.path.join(current_file_dir, "voucher-storage-key.json")
+                env_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                
                 error_msg = (
                     "Service account credentials with private key are required for signed URLs.\n\n"
                     "Current status:\n"
                     f"  - Credentials support signing: No\n"
                     f"  - Key file found: {'Yes' if key_exists else 'No'}\n"
+                    f"  - GOOGLE_APPLICATION_CREDENTIALS: {env_key_path or 'Not set'}\n"
+                    f"  - Expected fallback path: {expected_fallback}\n"
+                    f"  - Fallback file exists: {os.path.exists(expected_fallback) if expected_fallback else 'N/A'}\n"
                 )
                 
                 if not key_exists:
@@ -682,21 +689,36 @@ class S3Service:
                         "1. Go to: https://console.cloud.google.com/iam-admin/serviceaccounts?project=rocasoft\n"
                         "2. Find service account: voucher-storage-sa@rocasoft.iam.gserviceaccount.com\n"
                         "3. Click on the service account > Keys tab\n"
-                        "4. Find key ID: 787a7d7f282807b45e5b3795325a43cb945fcb75\n"
-                        "5. Click 'Add Key' > 'Create new key' > Select 'JSON'\n"
-                        "6. Download the JSON file\n"
-                        "7. Save it as 'voucher-storage-key.json' in the backend directory:\n"
-                        f"   {os.path.join(os.path.dirname(__file__), 'voucher-storage-key.json')}\n"
+                        "4. Click 'Add Key' > 'Create new key' > Select 'JSON'\n"
+                        "5. Download the JSON file\n"
+                        "6. Save it as 'voucher-storage-key.json' in the backend directory:\n"
+                        f"   {expected_fallback}\n"
                         "   OR set GOOGLE_APPLICATION_CREDENTIALS environment variable:\n"
                         "   export GOOGLE_APPLICATION_CREDENTIALS=\"/path/to/voucher-storage-key.json\"\n"
-                        "8. Restart the backend server\n"
+                        "7. Restart the backend server\n"
                     )
                 else:
+                    # Key file exists but credentials don't support signing
+                    # This could mean the file is invalid or the backend needs restart
+                    try:
+                        import json
+                        with open(key_path, 'r') as f:
+                            key_data = json.load(f)
+                            has_private_key = bool(key_data.get('private_key'))
+                            error_msg += (
+                                f"\nKey file found at: {key_path}\n"
+                                f"  - File contains private_key: {has_private_key}\n"
+                                f"  - Service account: {key_data.get('client_email', 'Unknown')}\n"
+                            )
+                    except Exception as e:
+                        error_msg += (
+                            f"\nKey file found at: {key_path}\n"
+                            f"  - Could not read/parse file: {e}\n"
+                        )
+                    
                     error_msg += (
-                        f"\nKey file found at: {key_path}\n"
-                        "However, credentials are not being loaded correctly.\n"
-                        "Please ensure the file is valid JSON and contains a 'private_key' field.\n"
-                        "Restart the backend server after placing the key file.\n"
+                        "\nThe backend server may need to be restarted to load the credentials.\n"
+                        "If the file is valid, restart the backend server.\n"
                     )
                 
                 return {"success": False, "error": error_msg}
