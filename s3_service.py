@@ -671,19 +671,37 @@ class S3Service:
             if not self._supports_signing:
                 # Try to reinitialize client if key file is now available
                 env_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-                if env_key_path and os.path.exists(env_key_path):
-                    logger.info(f"🔄 Key file now available at {env_key_path}, reinitializing GCS client...")
-                    try:
-                        client_result = _get_gcs_client()
-                        if isinstance(client_result, tuple) and len(client_result) == 3:
-                            self.client, self._supports_signing, self._key_file_path = client_result
-                            self.bucket = self.client.bucket(self.bucket_name) if self.client else None
-                            logger.info(f"✅ Successfully reinitialized GCS client with signing support: {self._supports_signing}")
-                        else:
-                            self.client = client_result
-                            self.bucket = self.client.bucket(self.bucket_name) if self.client else None
-                    except Exception as e:
-                        logger.warning(f"⚠️  Failed to reinitialize GCS client: {e}")
+                if env_key_path:
+                    # Check if file exists and is readable
+                    if os.path.exists(env_key_path):
+                        try:
+                            # Verify file is readable and contains private_key
+                            import json
+                            with open(env_key_path, 'r') as f:
+                                key_data = json.load(f)
+                                if key_data.get('private_key'):
+                                    logger.info(f"🔄 Key file now available at {env_key_path}, reinitializing GCS client...")
+                                    try:
+                                        client_result = _get_gcs_client()
+                                        if isinstance(client_result, tuple) and len(client_result) == 3:
+                                            self.client, self._supports_signing, self._key_file_path = client_result
+                                            self.bucket = self.client.bucket(self.bucket_name) if self.client else None
+                                            logger.info(f"✅ Successfully reinitialized GCS client with signing support: {self._supports_signing}")
+                                        else:
+                                            self.client = client_result
+                                            self.bucket = self.client.bucket(self.bucket_name) if self.client else None
+                                    except Exception as e:
+                                        logger.error(f"⚠️  Failed to reinitialize GCS client: {e}")
+                                        import traceback
+                                        logger.error(traceback.format_exc())
+                                else:
+                                    logger.warning(f"⚠️  Key file at {env_key_path} exists but does not contain private_key")
+                        except Exception as e:
+                            logger.error(f"⚠️  Error reading key file at {env_key_path}: {e}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+                    else:
+                        logger.warning(f"⚠️  GOOGLE_APPLICATION_CREDENTIALS points to {env_key_path} but file does not exist")
                 
                 # If still no signing support, provide detailed error
                 if not self._supports_signing:
