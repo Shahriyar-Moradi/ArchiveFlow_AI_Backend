@@ -60,8 +60,9 @@ def configure_cors():
                     "https://localhost",
                     "capacitor://localhost",
                     "ionic://localhost",
-                    # Add your production domains here
-                    # "https://yourdomain.com",
+                    # Production domains
+                    "https://docflowai-c88e6.web.app",
+                    "https://docflowai-c88e6.firebaseapp.com",
                 ],
                 "method": ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"],
                 "responseHeader": [

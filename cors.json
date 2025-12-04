@@ -7,7 +7,9 @@
       "http://localhost",
       "https://localhost",
       "capacitor://localhost",
-      "ionic://localhost"
+      "ionic://localhost",
+      "https://docflowai-c88e6.web.app",
+      "https://docflowai-c88e6.firebaseapp.com"
     ],
     "method": ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"],
     "responseHeader": [
