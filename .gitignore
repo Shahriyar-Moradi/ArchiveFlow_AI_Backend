@@ -18,6 +18,7 @@ ENV/
 # Credentials and secrets
 voucher-storage-key.json
 *-key.json
+rocasoft-*.json
 *-credentials.json
 *.pem
 *.key

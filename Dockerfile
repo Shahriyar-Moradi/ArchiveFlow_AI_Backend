@@ -19,6 +19,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Ensure service account key file is available (for Cloud Run signed URLs)
+# The key file should be in the build context directory
+# Note: In production, consider using Secret Manager instead of embedding the key
+RUN if [ -f voucher-storage-key.json ]; then \
+      echo "✅ Service account key file found"; \
+      chmod 600 voucher-storage-key.json; \
+    else \
+      echo "⚠️  Warning: voucher-storage-key.json not found - signed URLs will not work"; \
+    fi
+
 # Expose port 8080 (Cloud Run default)
 EXPOSE 8080
 
