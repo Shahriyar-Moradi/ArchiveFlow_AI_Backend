@@ -374,9 +374,15 @@ app = FastAPI(
 )
 
 # Configure CORS
+# Build allowed origins list from settings, ensuring production URLs are included
+allowed_origins = list(set(settings.CORS_ORIGINS + [
+    "https://docflowai-c88e6.web.app",
+    "https://docflowai-c88e6.firebaseapp.com"
+]))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URLs
+    allow_origins=allowed_origins,  # Specific origins (required when allow_credentials=True)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -385,6 +391,54 @@ app.add_middleware(
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Exception handlers to ensure CORS headers are included in error responses
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """HTTPException handler that ensures CORS headers are always present"""
+    # Get the origin from the request
+    origin = request.headers.get("origin")
+    
+    # Determine if origin is allowed
+    cors_headers = {}
+    if origin and origin in allowed_origins:
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    elif not origin:
+        # If no origin header, allow all (for non-browser clients)
+        cors_headers["Access-Control-Allow-Origin"] = "*"
+    
+    # Return error response with CORS headers
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=cors_headers
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler that ensures CORS headers are always present"""
+    # Get the origin from the request
+    origin = request.headers.get("origin")
+    
+    # Determine if origin is allowed
+    cors_headers = {}
+    if origin and origin in allowed_origins:
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    elif not origin:
+        # If no origin header, allow all (for non-browser clients)
+        cors_headers["Access-Control-Allow-Origin"] = "*"
+    
+    # Log the error for debugging
+    logger.error(f"Unhandled exception: {type(exc).__name__}: {str(exc)}", exc_info=True)
+    
+    # Return error response with CORS headers
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=cors_headers
+    )
 
 # Background flow processor
 async def flow_processor():
@@ -1876,8 +1930,20 @@ async def get_gcs_flow_files(flow_id: str):
                 processed_at = uploaded_at
             
             # Get GCS path and extract key
-            gcs_path = doc.get('gcs_path') or doc.get('gcs_temp_path', '')
+            # Priority: Use gcs_path for completed files, gcs_temp_path for pending/uploaded files
+            processing_status = doc.get('processing_status', 'pending')
+            if processing_status == 'completed' and doc.get('gcs_path'):
+                gcs_path = doc.get('gcs_path')
+            else:
+                # For pending/uploaded files, prioritize gcs_temp_path (actual storage location)
+                gcs_path = doc.get('gcs_temp_path') or doc.get('gcs_path', '')
+            
+            # Extract clean key from the path (handle gs:// URLs, bucket names, etc.)
             s3_key = extract_gcs_key_from_path(gcs_path, s3_service.bucket_name) if gcs_path else ''
+            
+            # If we still don't have a key and this is a temp file, log a warning
+            if not s3_key and processing_status in ['pending', 'uploaded', 'uploading']:
+                logger.warning(f"⚠️  Document {doc.get('document_id')} has no gcs_temp_path or gcs_path - filename: {doc.get('filename')}")
             
             # Parse organized_path using helper function
             organized_path = doc.get('organized_path', '')
@@ -1890,10 +1956,12 @@ async def get_gcs_flow_files(flow_id: str):
             metadata = doc.get('metadata', {})
             
             # Build file data
+            # Ensure s3_key is always the actual stored path, never a constructed path
+            final_s3_key = s3_key if s3_key else gcs_path if gcs_path else ''
             return {
                 'document_id': doc.get('document_id', ''),
                 'filename': doc.get('filename', ''),
-                's3_key': s3_key or gcs_path,
+                's3_key': final_s3_key,
                 'organized_path': organized_path,
                 'category': path_parts.get('category', ''),
                 'year': path_parts.get('year', ''),
@@ -3924,8 +3992,11 @@ async def get_presigned_url_internal(key: str, expiration: int = 3600):
             raise HTTPException(status_code=500, detail="GCS bucket not initialized")
         
         # Try generating presigned URL with key as-is first
-        logger.info(f"Attempting to generate V4 signed URL for key: {actual_key} (original: {key})")
+        logger.info(f"🔍 Attempting to generate V4 signed URL for key: {actual_key} (original: {key})")
         result = s3_service.generate_presigned_url(actual_key, expiration, method="GET")
+        
+        if result.get('success'):
+            logger.info(f"✅ Successfully generated presigned URL on first attempt for: {actual_key}")
         
         # If failed with "not found" error, try multiple fallback strategies
         if not result['success']:
@@ -3958,65 +4029,86 @@ async def get_presigned_url_internal(key: str, expiration: int = 3600):
                                     logger.info(f"Strategy 1: Checking Firestore for flow: {flow_id}, filename: {filename}")
                                     # Get all documents for this flow from Firestore
                                     firestore_docs, _ = firestore_service.get_documents_by_flow_id(flow_id, page=1, page_size=1000)
+                                    logger.info(f"Strategy 1: Found {len(firestore_docs)} documents in Firestore for flow {flow_id}")
                                     
                                     # Try to find a document with matching filename
                                     target_name_lower = filename.lower()
+                                    target_name_no_ext = target_name_lower.rsplit('.', 1)[0] if '.' in target_name_lower else target_name_lower
+                                    
+                                    # First pass: Exact filename match
                                     for doc in firestore_docs:
                                         doc_filename = doc.get('filename', '')
-                                        doc_gcs_path = doc.get('gcs_path', '')
-                                        doc_gcs_temp_path = doc.get('gcs_temp_path', '')
+                                        if not doc_filename:
+                                            continue
+                                            
+                                        doc_filename_lower = doc_filename.lower()
                                         
-                                        # Check if filename matches (case-insensitive, with fuzzy matching)
-                                        if doc_filename and doc_filename.lower() == target_name_lower:
-                                            # Try gcs_temp_path first (temp location - most likely for need_review files)
+                                        # Check for exact filename match (case-insensitive)
+                                        if doc_filename_lower == target_name_lower:
+                                            logger.info(f"Strategy 1: Found exact filename match in Firestore: {doc_filename}")
+                                            
+                                            # Try gcs_temp_path first (temp location - most likely for pending/uploaded files)
+                                            doc_gcs_temp_path = doc.get('gcs_temp_path', '')
                                             if doc_gcs_temp_path:
-                                                logger.info(f"Found file in Firestore, trying gcs_temp_path: {doc_gcs_temp_path}")
-                                                result = s3_service.generate_presigned_url(doc_gcs_temp_path, expiration, method="GET")
+                                                # Extract clean key from gcs_temp_path (handle gs:// URLs, bucket names, etc.)
+                                                gcs_temp_key = extract_gcs_key_from_path(doc_gcs_temp_path, s3_service.bucket_name)
+                                                logger.info(f"Strategy 1: Trying Firestore gcs_temp_path (extracted key: {gcs_temp_key})")
+                                                result = s3_service.generate_presigned_url(gcs_temp_key, expiration, method="GET")
                                                 if result['success']:
-                                                    actual_key = doc_gcs_temp_path
-                                                    logger.info(f"✅ Successfully generated URL using Firestore gcs_temp_path: {doc_gcs_temp_path}")
+                                                    actual_key = gcs_temp_key
+                                                    logger.info(f"✅ Successfully generated URL using Firestore gcs_temp_path: {gcs_temp_key}")
                                                     break
                                             
                                             # Try gcs_path (organized location)
-                                            if not result['success'] and doc_gcs_path:
-                                                # Extract key from gs:// URL if needed
-                                                gcs_key = doc_gcs_path.replace(f"gs://{s3_service.bucket_name}/", "")
-                                                if gcs_key.startswith('voucher-bucket-1/'):
-                                                    gcs_key = gcs_key.replace('voucher-bucket-1/', '', 1)
-                                                logger.info(f"Trying Firestore gcs_path: {gcs_key}")
-                                                result = s3_service.generate_presigned_url(gcs_key, expiration, method="GET")
-                                                if result['success']:
-                                                    actual_key = gcs_key
-                                                    logger.info(f"✅ Successfully generated URL using Firestore gcs_path: {gcs_key}")
-                                                    break
+                                            if not result['success']:
+                                                doc_gcs_path = doc.get('gcs_path', '')
+                                                if doc_gcs_path:
+                                                    # Extract key from gs:// URL if needed
+                                                    gcs_key = extract_gcs_key_from_path(doc_gcs_path, s3_service.bucket_name)
+                                                    logger.info(f"Strategy 1: Trying Firestore gcs_path (extracted key: {gcs_key})")
+                                                    result = s3_service.generate_presigned_url(gcs_key, expiration, method="GET")
+                                                    if result['success']:
+                                                        actual_key = gcs_key
+                                                        logger.info(f"✅ Successfully generated URL using Firestore gcs_path: {gcs_key}")
+                                                        break
                                     
-                                    # If still not found, try fuzzy filename matching
+                                    # Second pass: Fuzzy filename matching (without extension, special chars)
                                     if not result['success']:
-                                        target_clean = target_name_lower.replace(',', '').replace('_', '').replace('-', '').replace(' ', '')
+                                        target_clean = target_name_no_ext.replace(',', '').replace('_', '').replace('-', '').replace(' ', '').replace('.', '')
+                                        logger.info(f"Strategy 1: Trying fuzzy filename matching (target_clean: {target_clean})")
+                                        
                                         for doc in firestore_docs:
                                             doc_filename = doc.get('filename', '')
-                                            if doc_filename:
-                                                doc_filename_lower = doc_filename.lower()
-                                                doc_clean = doc_filename_lower.replace(',', '').replace('_', '').replace('-', '').replace(' ', '')
+                                            if not doc_filename:
+                                                continue
                                                 
-                                                if target_clean == doc_clean or (len(target_clean) > 5 and target_clean in doc_clean):
-                                                    # Try both paths
-                                                    for path_field in ['gcs_temp_path', 'gcs_path']:
-                                                        doc_path = doc.get(path_field, '')
-                                                        if doc_path:
-                                                            gcs_key = doc_path.replace(f"gs://{s3_service.bucket_name}/", "")
-                                                            if gcs_key.startswith('voucher-bucket-1/'):
-                                                                gcs_key = gcs_key.replace('voucher-bucket-1/', '', 1)
-                                                            logger.info(f"Trying Firestore {path_field}: {gcs_key}")
-                                                            result = s3_service.generate_presigned_url(gcs_key, expiration, method="GET")
-                                                            if result['success']:
-                                                                actual_key = gcs_key
-                                                                logger.info(f"✅ Successfully generated URL using Firestore {path_field}: {gcs_key}")
-                                                                break
-                                                    if result['success']:
-                                                        break
+                                            doc_filename_lower = doc_filename.lower()
+                                            doc_filename_no_ext = doc_filename_lower.rsplit('.', 1)[0] if '.' in doc_filename_lower else doc_filename_lower
+                                            doc_clean = doc_filename_no_ext.replace(',', '').replace('_', '').replace('-', '').replace(' ', '').replace('.', '')
+                                            
+                                            # Check if cleaned filenames match
+                                            if (target_clean == doc_clean or 
+                                                (len(target_clean) > 5 and target_clean in doc_clean) or
+                                                (len(doc_clean) > 5 and doc_clean in target_clean)):
+                                                logger.info(f"Strategy 1: Found fuzzy filename match: {doc_filename} (requested: {filename})")
+                                                
+                                                # Try both paths in order: temp first, then organized
+                                                for path_field in ['gcs_temp_path', 'gcs_path']:
+                                                    doc_path = doc.get(path_field, '')
+                                                    if doc_path:
+                                                        gcs_key = extract_gcs_key_from_path(doc_path, s3_service.bucket_name)
+                                                        logger.info(f"Strategy 1: Trying Firestore {path_field} (extracted key: {gcs_key})")
+                                                        result = s3_service.generate_presigned_url(gcs_key, expiration, method="GET")
+                                                        if result['success']:
+                                                            actual_key = gcs_key
+                                                            logger.info(f"✅ Successfully generated URL using Firestore {path_field} (fuzzy match): {gcs_key}")
+                                                            break
+                                                if result['success']:
+                                                    break
                             except Exception as firestore_error:
-                                logger.warning(f"Failed to check Firestore for file location: {firestore_error}")
+                                logger.warning(f"Strategy 1: Failed to check Firestore for file location: {firestore_error}")
+                                import traceback
+                                logger.debug(f"Strategy 1: Firestore error traceback:\n{traceback.format_exc()}")
                         
                         # Strategy 2: Try sanitized version (spaces -> underscores, remove parentheses and commas)
                         if not result['success']:
@@ -4075,77 +4167,7 @@ async def get_presigned_url_internal(key: str, expiration: int = 3600):
                                                 logger.info(f"✅ Successfully generated URL with found file key: {file_key}")
                                                 break
                             except Exception as search_error:
-                                logger.warning(f"Failed to search directory for matching file: {search_error}")
-                    
-                    # Strategy 4: Global filename search across known prefixes
-                    if not result['success']:
-                        try:
-                            path_segments = path_dir.split('/')
-                            if len(path_segments) >= 2 and path_segments[0] == 'temp':
-                                flow_id = path_segments[1]
-                                logger.info(f"File not found in GCS, checking Firestore for flow: {flow_id}, filename: {filename}")
-                                
-                                # Get all documents for this flow from Firestore
-                                firestore_docs, _ = firestore_service.get_documents_by_flow_id(flow_id, page=1, page_size=1000)
-                                
-                                # Try to find a document with matching filename
-                                target_name_lower = filename.lower()
-                                for doc in firestore_docs:
-                                    doc_filename = doc.get('filename', '')
-                                    doc_gcs_path = doc.get('gcs_path', '')
-                                    doc_gcs_temp_path = doc.get('gcs_temp_path', '')
-                                    
-                                    # Check if filename matches (case-insensitive, with fuzzy matching)
-                                    if doc_filename and doc_filename.lower() == target_name_lower:
-                                        # Try gcs_path first (organized location)
-                                        if doc_gcs_path:
-                                            # Extract key from gs:// URL if needed
-                                            gcs_key = doc_gcs_path.replace(f"gs://{s3_service.bucket_name}/", "")
-                                            if gcs_key.startswith('voucher-bucket-1/'):
-                                                gcs_key = gcs_key.replace('voucher-bucket-1/', '', 1)
-                                            logger.info(f"Found file in Firestore, trying gcs_path: {gcs_key}")
-                                            result = s3_service.generate_presigned_url(gcs_key, expiration, method="GET")
-                                            if result['success']:
-                                                actual_key = gcs_key
-                                                logger.info(f"✅ Successfully generated URL using Firestore gcs_path: {gcs_key}")
-                                                break
-                                        
-                                        # Try gcs_temp_path (temp location)
-                                        if not result['success'] and doc_gcs_temp_path:
-                                            logger.info(f"Trying Firestore gcs_temp_path: {doc_gcs_temp_path}")
-                                            result = s3_service.generate_presigned_url(doc_gcs_temp_path, expiration, method="GET")
-                                            if result['success']:
-                                                actual_key = doc_gcs_temp_path
-                                                logger.info(f"✅ Successfully generated URL using Firestore gcs_temp_path: {doc_gcs_temp_path}")
-                                                break
-                                
-                                # If still not found, try fuzzy filename matching
-                                if not result['success']:
-                                    target_clean = target_name_lower.replace(',', '').replace('_', '').replace('-', '').replace(' ', '')
-                                    for doc in firestore_docs:
-                                        doc_filename = doc.get('filename', '')
-                                        if doc_filename:
-                                            doc_filename_lower = doc_filename.lower()
-                                            doc_clean = doc_filename_lower.replace(',', '').replace('_', '').replace('-', '').replace(' ', '')
-                                            
-                                            if target_clean == doc_clean or (len(target_clean) > 5 and target_clean in doc_clean):
-                                                # Try both paths
-                                                for path_field in ['gcs_path', 'gcs_temp_path']:
-                                                    doc_path = doc.get(path_field, '')
-                                                    if doc_path:
-                                                        gcs_key = doc_path.replace(f"gs://{s3_service.bucket_name}/", "")
-                                                        if gcs_key.startswith('voucher-bucket-1/'):
-                                                            gcs_key = gcs_key.replace('voucher-bucket-1/', '', 1)
-                                                        logger.info(f"Trying Firestore {path_field}: {gcs_key}")
-                                                        result = s3_service.generate_presigned_url(gcs_key, expiration, method="GET")
-                                                        if result['success']:
-                                                            actual_key = gcs_key
-                                                            logger.info(f"✅ Successfully generated URL using Firestore {path_field}: {gcs_key}")
-                                                            break
-                                                if result['success']:
-                                                    break
-                        except Exception as firestore_error:
-                            logger.warning(f"Failed to check Firestore for file location: {firestore_error}")
+                                logger.warning(f"Strategy 3: Failed to search directory for matching file: {search_error}")
                     
                     # Strategy 4: Global filename search across known prefixes
                     if not result['success']:
@@ -4174,7 +4196,7 @@ async def get_presigned_url_internal(key: str, expiration: int = 3600):
                     logger.error(f"Fallback error traceback:\n{traceback.format_exc()}")
         
         if result['success']:
-            logger.info(f"✅ V4 signed URL generated for: {actual_key}")
+            logger.info(f"✅ V4 signed URL generated successfully for: {actual_key} (original request: {key})")
             return JSONResponse(content={
                 "success": True,
                 "url": result['url'],
@@ -4202,10 +4224,25 @@ async def get_presigned_url_internal(key: str, expiration: int = 3600):
                     )
                 )
             elif 'does not exist' in error_msg.lower() or 'not found' in error_msg.lower():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"File not found: {actual_key}. Please verify the file exists in GCS."
-                )
+                # Provide helpful error message with suggestions
+                error_detail = f"File not found: {actual_key}."
+                
+                # Extract flow_id and filename if this is a temp path
+                if '/temp/' in actual_key or actual_key.startswith('temp/'):
+                    path_parts = actual_key.split('/')
+                    if len(path_parts) >= 3:
+                        flow_id = path_parts[1]
+                        filename = path_parts[-1]
+                        error_detail += (
+                            f"\n\nTroubleshooting:\n"
+                            f"- Requested path: {actual_key}\n"
+                            f"- Flow ID: {flow_id}\n"
+                            f"- Filename: {filename}\n"
+                            f"- The file may have been stored with a UUID-based filename instead of the original filename.\n"
+                            f"- Use /api/debug/list-flow-files/{flow_id}?filename={filename} to find the correct path."
+                        )
+                
+                raise HTTPException(status_code=404, detail=error_detail)
             else:
                 raise HTTPException(status_code=500, detail=f"Failed to generate signed URL: {error_msg}")
     
