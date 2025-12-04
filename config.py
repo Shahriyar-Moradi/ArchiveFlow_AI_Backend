@@ -49,10 +49,14 @@ class Settings:
     
     # CORS Configuration
     # Allow origins for web, mobile, and Capacitor apps
-    CORS_ORIGINS: list = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:8080,http://localhost:4200,capacitor://localhost,ionic://localhost,http://localhost,https://localhost,https://docflowai-c88e6.web.app,https://docflowai-c88e6.firebaseapp.com"
-    ).split(",")
+    CORS_ORIGINS: list = [
+        origin.strip() 
+        for origin in os.getenv(
+            "CORS_ORIGINS",
+            "http://localhost:3000,http://localhost:8080,http://localhost:4200,capacitor://localhost,ionic://localhost,http://localhost,https://localhost,https://docflowai-c88e6.web.app,https://docflowai-c88e6.firebaseapp.com"
+        ).split(",")
+        if origin.strip()  # Remove empty strings
+    ]
     
     # Server Configuration
     HOST: str = os.getenv("HOST", "0.0.0.0")

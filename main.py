@@ -375,10 +375,12 @@ app = FastAPI(
 
 # Configure CORS
 # Build allowed origins list from settings, ensuring production URLs are included
-allowed_origins = list(set(settings.CORS_ORIGINS + [
+# Remove duplicates and ensure all origins are properly formatted
+production_origins = [
     "https://docflowai-c88e6.web.app",
     "https://docflowai-c88e6.firebaseapp.com"
-]))
+]
+allowed_origins = list(set(settings.CORS_ORIGINS + production_origins))
 
 app.add_middleware(
     CORSMiddleware,
@@ -391,6 +393,8 @@ app.add_middleware(
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Log allowed origins for debugging
+logger.info(f"CORS allowed origins: {allowed_origins}")
 
 # Exception handlers to ensure CORS headers are included in error responses
 @app.exception_handler(HTTPException)
