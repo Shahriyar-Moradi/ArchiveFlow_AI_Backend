@@ -667,21 +667,39 @@ class S3Service:
                 return {"success": False, "error": "GCS client not initialized"}
             
             # Check if credentials support signing before attempting
+            # Re-check credentials in case they became available after initialization
             if not self._supports_signing:
-                key_exists, key_path = _check_key_file_exists()
-                current_file_dir = os.path.dirname(__file__)
-                expected_fallback = os.path.join(current_file_dir, "voucher-storage-key.json")
+                # Try to reinitialize client if key file is now available
                 env_key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                if env_key_path and os.path.exists(env_key_path):
+                    logger.info(f"🔄 Key file now available at {env_key_path}, reinitializing GCS client...")
+                    try:
+                        client_result = _get_gcs_client()
+                        if isinstance(client_result, tuple) and len(client_result) == 3:
+                            self.client, self._supports_signing, self._key_file_path = client_result
+                            self.bucket = self.client.bucket(self.bucket_name) if self.client else None
+                            logger.info(f"✅ Successfully reinitialized GCS client with signing support: {self._supports_signing}")
+                        else:
+                            self.client = client_result
+                            self.bucket = self.client.bucket(self.bucket_name) if self.client else None
+                    except Exception as e:
+                        logger.warning(f"⚠️  Failed to reinitialize GCS client: {e}")
                 
-                error_msg = (
-                    "Service account credentials with private key are required for signed URLs.\n\n"
-                    "Current status:\n"
-                    f"  - Credentials support signing: No\n"
-                    f"  - Key file found: {'Yes' if key_exists else 'No'}\n"
-                    f"  - GOOGLE_APPLICATION_CREDENTIALS: {env_key_path or 'Not set'}\n"
-                    f"  - Expected fallback path: {expected_fallback}\n"
-                    f"  - Fallback file exists: {os.path.exists(expected_fallback) if expected_fallback else 'N/A'}\n"
-                )
+                # If still no signing support, provide detailed error
+                if not self._supports_signing:
+                    key_exists, key_path = _check_key_file_exists()
+                    current_file_dir = os.path.dirname(__file__)
+                    expected_fallback = os.path.join(current_file_dir, "voucher-storage-key.json")
+                    
+                    error_msg = (
+                        "Service account credentials with private key are required for signed URLs.\n\n"
+                        "Current status:\n"
+                        f"  - Credentials support signing: No\n"
+                        f"  - Key file found: {'Yes' if key_exists else 'No'}\n"
+                        f"  - GOOGLE_APPLICATION_CREDENTIALS: {env_key_path or 'Not set'}\n"
+                        f"  - Expected fallback path: {expected_fallback}\n"
+                        f"  - Fallback file exists: {os.path.exists(expected_fallback) if expected_fallback else 'N/A'}\n"
+                    )
                 
                 if not key_exists:
                     error_msg += (
