@@ -3,7 +3,6 @@ FastAPI Backend for Document Processing with GCP
 Handles OCR, batch processing, and document organization
 Version: GCP Migration - November 2025
 """
-
 import os
 import sys
 import json
