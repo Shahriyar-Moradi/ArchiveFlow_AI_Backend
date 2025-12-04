@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Environment variables
+.env
+*.env
+!env.template
+!ENV_TEMPLATE.txt
+
+# Credentials and secrets
+voucher-storage-key.json
+*-key.json
+*-credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs
+*.log
+backend_logs.txt
+server.log
+migration.log
+migration_output.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Processed files
+processed/
+uploads/
+batch_queue/
+flow_queue/
+
+# Data files
+processed_documents.json
+users.json
+
+# Docker
+.dockerignore
+
+# Temporary files
+*.tmp
+*.bak
+test.txt
+trigger_deploy.txt
+

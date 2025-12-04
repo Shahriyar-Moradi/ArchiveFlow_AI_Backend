@@ -1,0 +1,35 @@
+{
+  "SvRRs8-BOoyKU3YUw0hyow": {
+    "id": "SvRRs8-BOoyKU3YUw0hyow",
+    "email": "test@example.com",
+    "password": "$2b$12$kgrmP99ZgqpSqgi7mJw1We/Alvz/lJKXRNbpdd2fou/9csVaxUCyy",
+    "full_name": "Test User",
+    "created_at": "2025-10-07T10:45:26.172172"
+  },
+  "demo_admin_user": {
+    "id": "demo_admin_user",
+    "email": "admin@example.com",
+    "password": "$2b$12$Y7mV2dIwNh0cj0m.YU7cz.hWWpkVpTlq5shpdj9fC0cs5fsbgyR8O",
+    "full_name": "Admin User",
+    "created_at": "2025-11-26T12:06:17.718963",
+    "role": "admin"
+  },
+  "admin_example_user": {
+    "id": "admin_example_user",
+    "email": "admin@example.com",
+    "password": "$2b$12$NbYtIla3uO4pvY1iuUIxd.EBMzMbnumt.fLnUcaH8DGopmfTZpWsq",
+    "full_name": "Admin User",
+    "role": "admin",
+    "created_at": "2025-12-03T15:43:53.309324",
+    "is_active": true
+  },
+  "agent1_example_user": {
+    "id": "agent1_example_user",
+    "email": "agent1@example.com",
+    "password": "$2b$12$/hQJlV5Dd1DgO.PTTSXm2.vO4/CQPGPUZFtAhnXoxh.m4UXmKj1Ka",
+    "full_name": "Agent 1",
+    "role": "agent",
+    "created_at": "2025-12-03T15:43:53.529681",
+    "is_active": true
+  }
+}

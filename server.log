@@ -1,0 +1,5 @@
+  File "/Users/shahriar/Desktop/Desktop/Work/Document_Archive/MyDev/ArchiveFlow_AI/backend/main.py", line 1537
+    organized_path = doc.get('organized_path', '')
+IndentationError: unexpected indent
+
+ERROR conda.cli.main_run:execute(127): `conda run python3 main.py` failed. (See above for error)

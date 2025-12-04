@@ -1,0 +1,20 @@
+# RizanAI Backend Configuration
+# Copy this file to .env and fill in your actual values
+
+# AWS Configuration
+AWS_ACCESS_KEY_ID=your_aws_access_key_here
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key_here
+AWS_REGION=us-east-1
+
+# S3 Configuration
+S3_BUCKET_NAME=your-voucher-bucket-name
+
+# SQS Configuration
+SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/your-account/your-queue
+
+# DynamoDB Configuration
+DYNAMODB_TABLE_NAME=voucher-metadata
+
+# Server Configuration
+HOST=0.0.0.0
+PORT=8000

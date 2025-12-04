@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    image: rizanai-backend:latest
+    container_name: rizanai-backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Server Configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+      
+      # AWS Configuration
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-me-central-1}
+      
+      # S3 Configuration
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-rocabucket-1}
+      
+      # SQS Configuration
+      - SQS_QUEUE_URL=${SQS_QUEUE_URL}
+      - PROCESSED_QUEUE_URL=${PROCESSED_QUEUE_URL}
+      
+      # DynamoDB Configuration
+      - DYNAMODB_BATCHES_TABLE=${DYNAMODB_BATCHES_TABLE:-VoucherBatches-dev}
+      - DYNAMODB_DOCUMENTS_TABLE=${DYNAMODB_DOCUMENTS_TABLE:-VoucherDocuments-dev}
+      - DYNAMODB_LOGS_TABLE=${DYNAMODB_LOGS_TABLE:-ProcessingLogs-dev}
+      
+      # Google Cloud Storage Configuration
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME:-voucher-bucket-1}
+      - GCS_PROJECT_ID=${GCS_PROJECT_ID:-rocasoft}
+      - GCS_SERVICE_ACCOUNT_KEY=voucher-storage-key.json
+      
+      # Branch Configuration
+      - BRANCH_ID=${BRANCH_ID:-01}
+      
+      # Note: OCR now uses AWS Bedrock (Claude via AWS)
+      # AWS credentials above (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION) are used
+      
+    volumes:
+      # Mount volumes for persistent storage (optional for development)
+      - ./uploads:/app/backend/uploads
+      - ./processed:/app/backend/processed
+      - ./logs:/app/backend/logs
+      
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    networks:
+      - rizanai-network
+
+networks:
+  rizanai-network:
+    driver: bridge
+

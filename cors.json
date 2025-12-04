@@ -1,0 +1,30 @@
+[
+  {
+    "origin": [
+      "http://localhost:3000",
+      "http://localhost:8080",
+      "http://localhost:4200",
+      "http://localhost",
+      "https://localhost",
+      "capacitor://localhost",
+      "ionic://localhost"
+    ],
+    "method": ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"],
+    "responseHeader": [
+      "Content-Type",
+      "Content-Length",
+      "Content-Range",
+      "Accept",
+      "Authorization",
+      "X-Goog-Upload-Protocol",
+      "X-Goog-Upload-Command",
+      "X-Goog-Upload-Offset",
+      "X-Goog-Upload-Status",
+      "X-Goog-Upload-Chunk-Granularity",
+      "X-Goog-Upload-Header-Content-Length",
+      "X-Goog-Upload-Header-Content-Type"
+    ],
+    "maxAgeSeconds": 3600
+  }
+]
+

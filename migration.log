@@ -1,0 +1,123 @@
+2025-11-28 14:09:21,367 - INFO - 
+
+2025-11-28 14:09:21,367 - INFO - ================================================================================
+2025-11-28 14:09:21,367 - INFO -   GCS → FIRESTORE MIGRATION SCRIPT
+2025-11-28 14:09:21,367 - INFO - ================================================================================
+2025-11-28 14:09:21,367 - INFO - 🔍 DRY RUN MODE - No changes will be made
+2025-11-28 14:09:21,367 - INFO - 
+2025-11-28 14:09:21,733 - INFO - Firestore client initialized for project: rocasoft
+2025-11-28 14:09:21,733 - INFO - ✅ Firestore service initialized
+2025-11-28 14:09:22,088 - INFO - ✅ GCS service initialized
+2025-11-28 14:09:22,088 - INFO - ================================================================================
+2025-11-28 14:09:22,088 - INFO - Starting GCS to Firestore Flow Migration...
+2025-11-28 14:09:22,088 - INFO - ================================================================================
+2025-11-28 14:09:25,700 - INFO - 📊 Found 9 flows in GCS
+2025-11-28 14:09:28,028 - INFO - [DRY RUN] Would create flow: flow-20251126_144650 (Uploaded Flow)
+2025-11-28 14:09:28,320 - INFO - [DRY RUN] Would create flow: flow-20251126_144842 (Uploaded Flow)
+2025-11-28 14:09:29,376 - INFO - [DRY RUN] Would create flow: flow-20251126_151805 (Uploaded Flow)
+2025-11-28 14:09:29,669 - INFO - [DRY RUN] Would create flow: flow-20251126_152236 (Uploaded Flow)
+2025-11-28 14:09:30,784 - INFO - [DRY RUN] Would create flow: flow-20251126_152247 (Flow flow-20251126_152247)
+2025-11-28 14:09:31,069 - INFO - [DRY RUN] Would create flow: flow-20251127_130236 (Uploaded Flow)
+2025-11-28 14:09:32,132 - INFO - [DRY RUN] Would update flow: flow-20251127_131516 (Uploaded Flow)
+2025-11-28 14:09:32,442 - INFO - [DRY RUN] Would update flow: flow-20251127_132555 (Uploaded Flow)
+2025-11-28 14:09:33,495 - INFO - [DRY RUN] Would update flow: flow-20251128_121507 (Uploaded Flow)
+2025-11-28 14:09:33,499 - INFO - 
+2025-11-28 14:09:33,499 - INFO - ================================================================================
+2025-11-28 14:09:33,499 - INFO - ✅ Flow Migration Complete!
+2025-11-28 14:09:33,499 - INFO -    Created: 6 flows
+2025-11-28 14:09:33,499 - INFO -    Updated: 3 flows
+2025-11-28 14:09:33,499 - INFO -    Skipped: 0 flows
+2025-11-28 14:09:33,499 - INFO - ================================================================================
+2025-11-28 14:09:33,499 - INFO - 
+2025-11-28 14:09:33,499 - INFO - ================================================================================
+2025-11-28 14:09:33,500 - INFO -   MIGRATION SUMMARY
+2025-11-28 14:09:33,500 - INFO - ================================================================================
+2025-11-28 14:09:33,502 - INFO -   Duration: 11.41 seconds
+2025-11-28 14:09:33,502 - INFO -   Flows Created: 6
+2025-11-28 14:09:33,502 - INFO -   Flows Updated: 3
+2025-11-28 14:09:33,502 - INFO -   Flows Skipped: 0
+2025-11-28 14:09:33,502 - INFO - ================================================================================
+2025-11-28 14:09:33,502 - INFO - 
+2025-11-28 14:09:33,502 - INFO - ✅ Dry run complete. Run without --dry-run to apply changes.
+2025-11-28 14:22:35,214 - INFO - 
+
+2025-11-28 14:22:35,214 - INFO - ================================================================================
+2025-11-28 14:22:35,215 - INFO -   GCS → FIRESTORE MIGRATION SCRIPT
+2025-11-28 14:22:35,215 - INFO - ================================================================================
+2025-11-28 14:22:35,538 - INFO - Firestore client initialized for project: rocasoft
+2025-11-28 14:22:35,538 - INFO - ✅ Firestore service initialized
+2025-11-28 14:22:35,871 - INFO - ✅ GCS service initialized
+2025-11-28 14:22:35,871 - INFO - ================================================================================
+2025-11-28 14:22:35,871 - INFO - Starting GCS to Firestore Flow Migration...
+2025-11-28 14:22:35,871 - INFO - ================================================================================
+2025-11-28 14:22:39,515 - INFO - 📊 Found 9 flows in GCS
+2025-11-28 14:22:41,968 - INFO - ➕ Creating flow flow-20251126_144650 in Firestore
+2025-11-28 14:22:42,278 - INFO - Created flow record: flow-20251126_144650
+2025-11-28 14:22:42,279 - INFO - 
+  📄 Migrating documents for flow: flow-20251126_144650
+2025-11-28 14:22:43,050 - INFO -   ℹ️  No files found in GCS for flow flow-20251126_144650
+2025-11-28 14:22:43,335 - INFO - ➕ Creating flow flow-20251126_144842 in Firestore
+2025-11-28 14:22:44,409 - INFO - Created flow record: flow-20251126_144842
+2025-11-28 14:22:44,410 - INFO - 
+  📄 Migrating documents for flow: flow-20251126_144842
+2025-11-28 14:22:45,193 - INFO -   ℹ️  No files found in GCS for flow flow-20251126_144842
+2025-11-28 14:22:45,502 - INFO - ➕ Creating flow flow-20251126_151805 in Firestore
+2025-11-28 14:22:46,652 - INFO - Created flow record: flow-20251126_151805
+2025-11-28 14:22:46,653 - INFO - 
+  📄 Migrating documents for flow: flow-20251126_151805
+2025-11-28 14:22:47,472 - INFO -   ℹ️  No files found in GCS for flow flow-20251126_151805
+2025-11-28 14:22:47,759 - INFO - ➕ Creating flow flow-20251126_152236 in Firestore
+2025-11-28 14:22:48,824 - INFO - Created flow record: flow-20251126_152236
+2025-11-28 14:22:48,824 - INFO - 
+  📄 Migrating documents for flow: flow-20251126_152236
+2025-11-28 14:22:49,680 - INFO -   ℹ️  No files found in GCS for flow flow-20251126_152236
+2025-11-28 14:22:49,965 - INFO - ➕ Creating flow flow-20251126_152247 in Firestore
+2025-11-28 14:22:51,051 - INFO - Created flow record: flow-20251126_152247
+2025-11-28 14:22:51,052 - INFO - 
+  📄 Migrating documents for flow: flow-20251126_152247
+2025-11-28 14:22:51,833 - INFO -   📊 Found 1 files in GCS for flow flow-20251126_152247
+2025-11-28 14:22:53,204 - INFO - Created document record: flow-20251126_152247_WhatsApp_Image_2025-11-25_at_11.04.04.jpeg
+2025-11-28 14:22:53,205 - INFO -   ✅ Document migration for flow flow-20251126_152247: 1 created, 0 updated, 0 skipped
+2025-11-28 14:22:53,779 - INFO - ➕ Creating flow flow-20251127_130236 in Firestore
+2025-11-28 14:22:54,613 - INFO - Created flow record: flow-20251127_130236
+2025-11-28 14:22:54,614 - INFO - 
+  📄 Migrating documents for flow: flow-20251127_130236
+2025-11-28 14:22:55,410 - INFO -   📊 Found 1 files in GCS for flow flow-20251127_130236
+2025-11-28 14:22:56,811 - INFO - Created document record: flow-20251127_130236_WhatsApp_Image_2025-11-25_at_11.18.57.jpeg
+2025-11-28 14:22:56,811 - INFO -   ✅ Document migration for flow flow-20251127_130236: 1 created, 0 updated, 0 skipped
+2025-11-28 14:22:57,458 - INFO - 📝 Updating flow flow-20251127_131516 in Firestore
+2025-11-28 14:22:58,177 - INFO - Updated flow record: flow-20251127_131516
+2025-11-28 14:22:58,177 - INFO - 
+  📄 Migrating documents for flow: flow-20251127_131516
+2025-11-28 14:22:58,968 - INFO -   📊 Found 2 files in GCS for flow flow-20251127_131516
+2025-11-28 14:23:00,339 - INFO - Created document record: flow-20251127_131516_WhatsApp_Image_2025-11-25_at_11.04.04.jpeg
+2025-11-28 14:23:01,698 - INFO - Created document record: flow-20251127_131516_WhatsApp_Image_2025-11-25_at_11.18.57.jpeg
+2025-11-28 14:23:01,698 - INFO -   ✅ Document migration for flow flow-20251127_131516: 2 created, 0 updated, 0 skipped
+2025-11-28 14:23:02,538 - INFO - 📝 Updating flow flow-20251127_132555 in Firestore
+2025-11-28 14:23:03,109 - INFO - Updated flow record: flow-20251127_132555
+2025-11-28 14:23:03,110 - INFO - 
+  📄 Migrating documents for flow: flow-20251127_132555
+2025-11-28 14:23:03,964 - INFO -   ℹ️  No files found in GCS for flow flow-20251127_132555
+2025-11-28 14:23:04,264 - INFO - 📝 Updating flow flow-20251128_121507 in Firestore
+2025-11-28 14:23:05,339 - INFO - Updated flow record: flow-20251128_121507
+2025-11-28 14:23:05,339 - INFO - 
+  📄 Migrating documents for flow: flow-20251128_121507
+2025-11-28 14:23:06,124 - INFO -   ℹ️  No files found in GCS for flow flow-20251128_121507
+2025-11-28 14:23:06,125 - INFO - 
+2025-11-28 14:23:06,125 - INFO - ================================================================================
+2025-11-28 14:23:06,125 - INFO - ✅ Flow Migration Complete!
+2025-11-28 14:23:06,125 - INFO -    Created: 6 flows
+2025-11-28 14:23:06,125 - INFO -    Updated: 3 flows
+2025-11-28 14:23:06,125 - INFO -    Skipped: 0 flows
+2025-11-28 14:23:06,125 - INFO - ================================================================================
+2025-11-28 14:23:06,125 - INFO - 
+2025-11-28 14:23:06,125 - INFO - ================================================================================
+2025-11-28 14:23:06,125 - INFO -   MIGRATION SUMMARY
+2025-11-28 14:23:06,125 - INFO - ================================================================================
+2025-11-28 14:23:06,126 - INFO -   Duration: 30.25 seconds
+2025-11-28 14:23:06,126 - INFO -   Flows Created: 6
+2025-11-28 14:23:06,126 - INFO -   Flows Updated: 3
+2025-11-28 14:23:06,126 - INFO -   Flows Skipped: 0
+2025-11-28 14:23:06,126 - INFO - ================================================================================
+2025-11-28 14:23:06,126 - INFO - 
+2025-11-28 14:23:06,127 - INFO - ✅ Migration complete! Check migration.log for details.
