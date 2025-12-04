@@ -1524,19 +1524,23 @@ async def create_gcs_flow(
             raise Exception(f"Failed to create flow in Firestore: {firestore_error}")
         
         # BACKUP: Sync to GCS asynchronously (non-blocking, optional)
-        async def sync_flow_to_gcs():
-            try:
-                logger.info(f"📂 Syncing flow to GCS (backup): {flow_id}")
-                result = s3_service.create_flow_metadata_in_s3(flow_id, actual_flow_name, created_at)
-                if result.get("success"):
-                    logger.info(f"✅ Flow {flow_id} synced to GCS backup")
-                else:
-                    logger.warning(f"⚠️  Failed to sync flow to GCS: {result.get('error')}")
-            except Exception as gcs_error:
-                logger.warning(f"⚠️  GCS sync failed (non-critical): {gcs_error}")
-        
-        # Start GCS sync in background (don't wait for it)
-        asyncio.create_task(sync_flow_to_gcs())
+        # Only sync if s3_service is available and initialized
+        if s3_service and s3_service.client and s3_service.bucket:
+            async def sync_flow_to_gcs():
+                try:
+                    logger.info(f"📂 Syncing flow to GCS (backup): {flow_id}")
+                    result = s3_service.create_flow_metadata_in_s3(flow_id, actual_flow_name, created_at)
+                    if result.get("success"):
+                        logger.info(f"✅ Flow {flow_id} synced to GCS backup")
+                    else:
+                        logger.warning(f"⚠️  Failed to sync flow to GCS: {result.get('error')}")
+                except Exception as gcs_error:
+                    logger.warning(f"⚠️  GCS sync failed (non-critical): {gcs_error}")
+            
+            # Start GCS sync in background (don't wait for it)
+            asyncio.create_task(sync_flow_to_gcs())
+        else:
+            logger.warning(f"⚠️  GCS service not available, skipping flow sync to GCS")
         
         # Invalidate flows cache
         if 'flows' in _flows_cache:

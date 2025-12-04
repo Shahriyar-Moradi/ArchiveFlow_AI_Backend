@@ -423,22 +423,42 @@ class S3Service:
         self, flow_id: str, flow_name: str, created_at: str = None
     ) -> Dict[str, Any]:
         try:
+            # Check if client and bucket are initialized
+            if not self.client:
+                logger.error("❌ GCS client not initialized")
+                return {"success": False, "error": "GCS client not initialized"}
+            
+            if not self.bucket:
+                logger.error(f"❌ GCS bucket '{self.bucket_name}' not accessible")
+                return {"success": False, "error": f"GCS bucket '{self.bucket_name}' not accessible"}
+            
             meta = {
                 "flow_id": flow_id,
                 "flow_name": flow_name,
                 "created_at": created_at or self._now().isoformat(),
                 "total_files": 0,
             }
-            self._blob(self._flow_meta_key(flow_id)).upload_from_string(
+            
+            flow_meta_key = self._flow_meta_key(flow_id)
+            logger.info(f"📝 Creating flow metadata in GCS: {flow_meta_key}")
+            
+            blob = self._blob(flow_meta_key)
+            blob.upload_from_string(
                 json.dumps(meta, indent=2), content_type="application/json"
             )
+            
+            logger.info(f"✅ Flow metadata created in GCS: {flow_meta_key}")
             
             # Update cache
             self._flow_metadata_cache[flow_id] = (meta, time.time())
             
             return {"success": True, "flow": meta}
         except Exception as exc:
-            return {"success": False, "error": f"Failed to create flow metadata: {exc}"}
+            error_msg = str(exc)
+            logger.error(f"❌ Failed to create flow metadata in GCS: {error_msg}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "error": f"Failed to create flow metadata in storage: {error_msg}"}
 
     def get_flow_metadata_from_s3(self, flow_id: str) -> Dict[str, Any]:
         try:
