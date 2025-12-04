@@ -21,6 +21,9 @@ try:
 except ImportError:
     PYMUPDF_AVAILABLE = False
 
+# Initialize logger BEFORE any code that might use it
+logger = logging.getLogger(__name__)
+
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -43,8 +46,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 from config import settings
 from services.anthropic_utils import detect_model_not_found_error
 from services.json_utils import extract_json_from_text
-
-logger = logging.getLogger(__name__)
 
 # Module-level singleton for CLIP classifier - loads once, reused by all instances
 _clip_classifier_singleton = None
@@ -1577,8 +1578,12 @@ Return in JSON format:
                         result['is_valid_voucher'] = result['classification'] in self.voucher_types
                     else:
                         # No document number found via regex
-                        # For vouchers with voucher_specific extraction, this is critical
-                        if extraction_method == 'voucher_specific':
+                        # Check if this is a general document type that doesn't require document_no
+                        general_doc_types = ['Proof of Payment', 'ID', 'SPA', 'Invoices', 'Invoice']
+                        is_general_doc = document_type in general_doc_types or any(dt.lower() in document_type.lower() for dt in general_doc_types)
+                        
+                        if extraction_method == 'voucher_specific' and not is_general_doc:
+                            # For vouchers with voucher_specific extraction, missing document_no is critical
                             filename = os.path.basename(image_path)
                             result['document_no'] = os.path.splitext(filename)[0]
                             result['complete_filename'] = result['document_no']
@@ -1586,13 +1591,18 @@ Return in JSON format:
                             result['success'] = False
                             result['error'] = "Could not extract Document No from voucher"
                             result['organized_path'] = None
+                            logger.warning(f"Voucher document missing document_no - marking as failed: {document_type}")
                         else:
-                            # For general documents, missing document_no is acceptable
-                            logger.info(f"No document number found for general document type '{document_type}', will use fallback")
+                            # For general documents (Proof of Payment, ID, SPA, etc.), missing document_no is acceptable
+                            logger.info(f"No document number found for document type '{document_type}' - treating as general document")
                             result['document_no'] = ''
                             result['classification'] = document_type
                             result['complete_filename'] = original_filename or 'document'
                             result['is_valid_voucher'] = False
+                            # Keep success=True for general documents without document_no
+                            if not result.get('success'):
+                                result['success'] = True
+                            logger.info(f"Document will be processed as general document type: {document_type}")
             
             # Generate organized path
             if result['success']:

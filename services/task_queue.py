@@ -342,15 +342,26 @@ class TaskQueue:
                             logger.warning(f"Could not increment flow document count: flow_id not available for document {document_id}")
                     else:
                         # UNKNOWN classification - mark as failed
-                        logger.warning(f"UNKNOWN classification for document {document_id}")
+                        error_msg = 'Document classified as UNKNOWN - unable to determine document type'
+                        logger.error(f"❌ Processing FAILED for document {document_id}: {error_msg}")
+                        logger.error(f"   - Classification: {result.get('classification', 'N/A')}")
+                        logger.error(f"   - Document type: {result.get('document_type', 'N/A')}")
+                        logger.error(f"   - Success: {result.get('success', False)}")
+                        logger.error(f"   - Error from result: {result.get('error', 'No error message')}")
                         self.firestore_service.update_document(document_id, {
                             'processing_status': 'failed',
-                            'error': 'Document classified as UNKNOWN - unable to determine document type'
+                            'error': error_msg
                         })
                 elif not handled_need_review:
                     # Processing failed (skip if we already handled need_review)
                     error_msg = result.get('error', 'Unknown error during processing')
-                    logger.error(f"Processing failed for document {document_id}: {error_msg}")
+                    logger.error(f"❌ Processing FAILED for document {document_id}: {error_msg}")
+                    logger.error(f"   - Result success: {result.get('success', False)}")
+                    logger.error(f"   - Classification: {result.get('classification', 'N/A')}")
+                    logger.error(f"   - Document type: {result.get('document_type', 'N/A')}")
+                    logger.error(f"   - Validation status: {result.get('validation_status', 'N/A')}")
+                    logger.error(f"   - Validation confidence: {result.get('validation_confidence', 'N/A')}")
+                    logger.error(f"   - Full result keys: {list(result.keys())}")
                     
                     # Include validation metadata if available
                     metadata = {}
@@ -362,7 +373,9 @@ class TaskQueue:
                     
                     update_data = {
                         'processing_status': 'failed',
-                        'error': error_msg
+                        'error': error_msg,
+                        'classification': result.get('classification', 'UNKNOWN'),
+                        'document_type': result.get('document_type', 'Other')
                     }
                     
                     if metadata:
@@ -405,10 +418,13 @@ class TaskQueue:
             logger.info(f"Completed background processing for document: {document_id}")
             
         except Exception as e:
-            logger.error(f"Error in background task for document {document_id}: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"❌ EXCEPTION in background task for document {document_id}: {error_msg}")
+            import traceback
+            logger.error(f"   - Traceback: {traceback.format_exc()}")
             self.firestore_service.update_document(document_id, {
                 'processing_status': 'failed',
-                'error': str(e)
+                'error': error_msg
             })
             
             if job_id:
