@@ -48,180 +48,182 @@ from services.anthropic_utils import detect_model_not_found_error
 from services.json_utils import extract_json_from_text
 
 # Module-level singleton for CLIP classifier - loads once, reused by all instances
+# ZERO-SHOT VALIDATION TEMPORARILY DISABLED - Code preserved for future use
 _clip_classifier_singleton = None
 _clip_classifier_lock = None
 
-def _get_clip_classifier():
-    """
-    Get or create the CLIP classifier singleton.
-    Model loads only ONCE and stays in memory for all subsequent uses.
-    
-    Returns:
-        CLIP classifier pipeline instance or None if unavailable
-    """
-    global _clip_classifier_singleton, _clip_classifier_lock
-    
-    # Import threading only if needed
-    if _clip_classifier_lock is None:
-        import threading
-        _clip_classifier_lock = threading.Lock()
-    
-    # If already loaded, return the singleton (FAST PATH - no lock needed)
-    if _clip_classifier_singleton is not None:
-        return _clip_classifier_singleton
-    
-    # Thread-safe initialization (only happens once)
-    with _clip_classifier_lock:
-        # Double-check pattern - another thread might have loaded it
-        if _clip_classifier_singleton is not None:
-            return _clip_classifier_singleton
-        
-        # Load the model (ONLY ONCE)
-        if not TRANSFORMERS_AVAILABLE:
-            logger.warning("transformers library not available - zero-shot image validation will be disabled")
-            return None
-        
-        model_name = "openai/clip-vit-large-patch14-336"
-        max_retries = 3
-        retry_delay = 2  # seconds
-        
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Loading CLIP classifier model (attempt {attempt}/{max_retries})...")
-                logger.info(f"Model: {model_name}")
-                logger.info("This may take a minute on first load (downloading from HuggingFace)...")
-                
-                # Check for HuggingFace cache directory
-                hf_home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
-                logger.info(f"HuggingFace cache location: {hf_home}")
-                
-                # Try to load the pipeline
-                # The pipeline will automatically download the model if not cached
-                try:
-                    import torch
-                    
-                    logger.info("Attempting to load CLIP model with transformers pipeline...")
-                    
-                    # Determine device (GPU if available, else CPU)
-                    device = 0 if torch.cuda.is_available() else -1
-                    if device == 0:
-                        logger.info("Using GPU for CLIP model")
-                    else:
-                        logger.info("Using CPU for CLIP model")
-                    
-                    # Load pipeline - it will download from HuggingFace if not cached
-                    # By default, local_files_only=False, so it will download if needed
-                    _clip_classifier_singleton = pipeline(
-                        "zero-shot-image-classification",
-                        model=model_name,
-                        device=device
-                    )
-                    
-                    logger.info("✅ CLIP classifier model loaded successfully and cached in memory")
-                    logger.info("All subsequent classifications will use this cached model (no reload)")
-                    return _clip_classifier_singleton
-                    
-                except Exception as pipeline_error:
-                    error_str = str(pipeline_error)
-                    logger.warning(f"Pipeline loading failed: {error_str}")
-                    
-                    # If it's a connection error, we'll retry in the outer loop
-                    if "connect" in error_str.lower() or "network" in error_str.lower():
-                        raise  # Re-raise to trigger retry logic
-                    
-                    # For other errors, try alternative loading method
-                    logger.info("Trying alternative loading method...")
-                    try:
-                        from transformers import CLIPProcessor, CLIPModel
-                        import torch
-                        
-                        logger.info("Attempting to load CLIP model components separately...")
-                        processor = CLIPProcessor.from_pretrained(model_name, local_files_only=False)
-                        model = CLIPModel.from_pretrained(model_name, local_files_only=False)
-                        
-                        # Move model to device
-                        device_str = "cuda" if torch.cuda.is_available() else "cpu"
-                        model = model.to(device_str)
-                        model.eval()
-                        
-                        # Create a simple wrapper for zero-shot classification
-                        def classify_image(image, candidate_labels):
-                            inputs = processor(images=image, text=candidate_labels, return_tensors="pt", padding=True)
-                            # Move inputs to device
-                            inputs = {k: v.to(device_str) for k, v in inputs.items()}
-                            
-                            with torch.no_grad():
-                                outputs = model(**inputs)
-                                logits_per_image = outputs.logits_per_image
-                                probs = logits_per_image.softmax(dim=1)
-                            
-                            results = []
-                            for i, label in enumerate(candidate_labels):
-                                results.append({
-                                    'label': label,
-                                    'score': float(probs[0][i])
-                                })
-                            return sorted(results, key=lambda x: x['score'], reverse=True)
-                        
-                        # Create a simple pipeline-like object
-                        class SimpleCLIPClassifier:
-                            def __init__(self, model, processor, classify_fn):
-                                self.model = model
-                                self.processor = processor
-                                self._classify = classify_fn
-                            
-                            def __call__(self, image, candidate_labels):
-                                return self._classify(image, candidate_labels)
-                        
-                        _clip_classifier_singleton = SimpleCLIPClassifier(model, processor, classify_image)
-                        logger.info("✅ CLIP classifier model loaded successfully (alternative method)")
-                        logger.info("All subsequent classifications will use this cached model (no reload)")
-                        return _clip_classifier_singleton
-                        
-                    except Exception as alt_error:
-                        logger.warning(f"Alternative loading method also failed: {alt_error}")
-                        raise pipeline_error  # Re-raise original error to trigger retry
-                
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Failed to load CLIP classifier (attempt {attempt}/{max_retries}): {error_msg}")
-                
-                # Check if it's a network/connection error
-                if "connect" in error_msg.lower() or "network" in error_msg.lower() or "timeout" in error_msg.lower():
-                    if attempt < max_retries:
-                        logger.warning(f"Network error detected. Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        continue
-                    else:
-                        logger.error("Max retries reached. Network connection to HuggingFace failed.")
-                        logger.error("Possible solutions:")
-                        logger.error("1. Check internet connection")
-                        logger.error("2. Check firewall/proxy settings")
-                        logger.error("3. Set HF_HOME environment variable to use cached models")
-                        logger.error("4. Pre-download model: python -c 'from transformers import pipeline; pipeline(\"zero-shot-image-classification\", model=\"openai/clip-vit-large-patch14-336\")'")
-                
-                # Check if it's a cache/local files issue
-                elif "local_files_only" in error_msg.lower() or "cache" in error_msg.lower():
-                    logger.warning("Cache/local files issue detected. Trying to download from HuggingFace...")
-                    if attempt < max_retries:
-                        time.sleep(retry_delay)
-                        retry_delay *= 2
-                        continue
-                
-                # For other errors, log and retry once more
-                if attempt < max_retries:
-                    logger.warning(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    logger.error(f"Failed to load CLIP classifier after {max_retries} attempts.")
-                    logger.error(f"Final error: {error_msg}")
-                    import traceback
-                    logger.error(f"Full traceback:\n{traceback.format_exc()}")
-                    return None
-        
-        return None
+# ZERO-SHOT VALIDATION TEMPORARILY DISABLED - Code preserved for future use
+# def _get_clip_classifier():
+#     """
+#     Get or create the CLIP classifier singleton.
+#     Model loads only ONCE and stays in memory for all subsequent uses.
+#     
+#     Returns:
+#         CLIP classifier pipeline instance or None if unavailable
+#     """
+#     global _clip_classifier_singleton, _clip_classifier_lock
+#     
+#     # Import threading only if needed
+#     if _clip_classifier_lock is None:
+#         import threading
+#         _clip_classifier_lock = threading.Lock()
+#     
+#     # If already loaded, return the singleton (FAST PATH - no lock needed)
+#     if _clip_classifier_singleton is not None:
+#         return _clip_classifier_singleton
+#     
+#     # Thread-safe initialization (only happens once)
+#     with _clip_classifier_lock:
+#         # Double-check pattern - another thread might have loaded it
+#         if _clip_classifier_singleton is not None:
+#             return _clip_classifier_singleton
+#         
+#         # Load the model (ONLY ONCE)
+#         if not TRANSFORMERS_AVAILABLE:
+#             logger.warning("transformers library not available - zero-shot image validation will be disabled")
+#             return None
+#         
+#         model_name = "openai/clip-vit-large-patch14-336"
+#         max_retries = 3
+#         retry_delay = 2  # seconds
+#         
+#         for attempt in range(1, max_retries + 1):
+#             try:
+#                 logger.info(f"Loading CLIP classifier model (attempt {attempt}/{max_retries})...")
+#                 logger.info(f"Model: {model_name}")
+#                 logger.info("This may take a minute on first load (downloading from HuggingFace)...")
+#                 
+#                 # Check for HuggingFace cache directory
+#                 hf_home = os.environ.get('HF_HOME') or os.path.expanduser('~/.cache/huggingface')
+#                 logger.info(f"HuggingFace cache location: {hf_home}")
+#                 
+#                 # Try to load the pipeline
+#                 # The pipeline will automatically download the model if not cached
+#                 try:
+#                     import torch
+#                     
+#                     logger.info("Attempting to load CLIP model with transformers pipeline...")
+#                     
+#                     # Determine device (GPU if available, else CPU)
+#                     device = 0 if torch.cuda.is_available() else -1
+#                     if device == 0:
+#                         logger.info("Using GPU for CLIP model")
+#                     else:
+#                         logger.info("Using CPU for CLIP model")
+#                     
+#                     # Load pipeline - it will download from HuggingFace if not cached
+#                     # By default, local_files_only=False, so it will download if needed
+#                     _clip_classifier_singleton = pipeline(
+#                         "zero-shot-image-classification",
+#                         model=model_name,
+#                         device=device
+#                     )
+#                     
+#                     logger.info("✅ CLIP classifier model loaded successfully and cached in memory")
+#                     logger.info("All subsequent classifications will use this cached model (no reload)")
+#                     return _clip_classifier_singleton
+#                     
+#                 except Exception as pipeline_error:
+#                     error_str = str(pipeline_error)
+#                     logger.warning(f"Pipeline loading failed: {error_str}")
+#                     
+#                     # If it's a connection error, we'll retry in the outer loop
+#                     if "connect" in error_str.lower() or "network" in error_str.lower():
+#                         raise  # Re-raise to trigger retry logic
+#                     
+#                     # For other errors, try alternative loading method
+#                     logger.info("Trying alternative loading method...")
+#                     try:
+#                         from transformers import CLIPProcessor, CLIPModel
+#                         import torch
+#                         
+#                         logger.info("Attempting to load CLIP model components separately...")
+#                         processor = CLIPProcessor.from_pretrained(model_name, local_files_only=False)
+#                         model = CLIPModel.from_pretrained(model_name, local_files_only=False)
+#                         
+#                         # Move model to device
+#                         device_str = "cuda" if torch.cuda.is_available() else "cpu"
+#                         model = model.to(device_str)
+#                         model.eval()
+#                         
+#                         # Create a simple wrapper for zero-shot classification
+#                         def classify_image(image, candidate_labels):
+#                             inputs = processor(images=image, text=candidate_labels, return_tensors="pt", padding=True)
+#                             # Move inputs to device
+#                             inputs = {k: v.to(device_str) for k, v in inputs.items()}
+#                             
+#                             with torch.no_grad():
+#                                 outputs = model(**inputs)
+#                                 logits_per_image = outputs.logits_per_image
+#                                 probs = logits_per_image.softmax(dim=1)
+#                             
+#                             results = []
+#                             for i, label in enumerate(candidate_labels):
+#                                 results.append({
+#                                     'label': label,
+#                                     'score': float(probs[0][i])
+#                                 })
+#                             return sorted(results, key=lambda x: x['score'], reverse=True)
+#                         
+#                         # Create a simple pipeline-like object
+#                         class SimpleCLIPClassifier:
+#                             def __init__(self, model, processor, classify_fn):
+#                                 self.model = model
+#                                 self.processor = processor
+#                                 self._classify = classify_fn
+#                             
+#                             def __call__(self, image, candidate_labels):
+#                                 return self._classify(image, candidate_labels)
+#                         
+#                         _clip_classifier_singleton = SimpleCLIPClassifier(model, processor, classify_image)
+#                         logger.info("✅ CLIP classifier model loaded successfully (alternative method)")
+#                         logger.info("All subsequent classifications will use this cached model (no reload)")
+#                         return _clip_classifier_singleton
+#                         
+#                     except Exception as alt_error:
+#                         logger.warning(f"Alternative loading method also failed: {alt_error}")
+#                         raise pipeline_error  # Re-raise original error to trigger retry
+#                 
+#             except Exception as e:
+#                 error_msg = str(e)
+#                 logger.error(f"Failed to load CLIP classifier (attempt {attempt}/{max_retries}): {error_msg}")
+#                 
+#                 # Check if it's a network/connection error
+#                 if "connect" in error_msg.lower() or "network" in error_msg.lower() or "timeout" in error_msg.lower():
+#                     if attempt < max_retries:
+#                         logger.warning(f"Network error detected. Retrying in {retry_delay} seconds...")
+#                         time.sleep(retry_delay)
+#                         retry_delay *= 2  # Exponential backoff
+#                         continue
+#                     else:
+#                         logger.error("Max retries reached. Network connection to HuggingFace failed.")
+#                         logger.error("Possible solutions:")
+#                         logger.error("1. Check internet connection")
+#                         logger.error("2. Check firewall/proxy settings")
+#                         logger.error("3. Set HF_HOME environment variable to use cached models")
+#                         logger.error("4. Pre-download model: python -c 'from transformers import pipeline; pipeline(\"zero-shot-image-classification\", model=\"openai/clip-vit-large-patch14-336\")'")
+#                 
+#                 # Check if it's a cache/local files issue
+#                 elif "local_files_only" in error_msg.lower() or "cache" in error_msg.lower():
+#                     logger.warning("Cache/local files issue detected. Trying to download from HuggingFace...")
+#                     if attempt < max_retries:
+#                         time.sleep(retry_delay)
+#                         retry_delay *= 2
+#                         continue
+#                 
+#                 # For other errors, log and retry once more
+#                 if attempt < max_retries:
+#                     logger.warning(f"Retrying in {retry_delay} seconds...")
+#                     time.sleep(retry_delay)
+#                     retry_delay *= 2
+#                 else:
+#                     logger.error(f"Failed to load CLIP classifier after {max_retries} attempts.")
+#                     logger.error(f"Final error: {error_msg}")
+#                     import traceback
+#                     logger.error(f"Full traceback:\n{traceback.format_exc()}")
+#                     return None
+#         
+#         return None
 
 class DocumentProcessor:
     """Document processing service using Anthropic API for OCR"""
@@ -262,14 +264,15 @@ class DocumentProcessor:
             9: "sep", 10: "oct", 11: "nov", 12: "dec"
         }
         
-        # Zero-shot image classifier configuration
-        # NOTE: Classifier is loaded lazily via singleton pattern - model loads only ONCE
-        self.CONFIDENCE_THRESHOLD = 0.90  # 90% confidence required for document validation
-        self.VALIDATION_LABELS = ["Valid document", "other"]
-        
-        # Don't load classifier here - it will be loaded on first use via singleton
-        # This ensures the model loads only once and stays in memory
-        logger.info("DocumentProcessor initialized. CLIP classifier will load on first use (singleton pattern)")
+        # ZERO-SHOT VALIDATION TEMPORARILY DISABLED - Code preserved for future use
+        # # Zero-shot image classifier configuration
+        # # NOTE: Classifier is loaded lazily via singleton pattern - model loads only ONCE
+        # self.CONFIDENCE_THRESHOLD = 0.90  # 90% confidence required for document validation
+        # self.VALIDATION_LABELS = ["Valid document", "other"]
+        # 
+        # # Don't load classifier here - it will be loaded on first use via singleton
+        # # This ensures the model loads only once and stays in memory
+        # logger.info("DocumentProcessor initialized. CLIP classifier will load on first use (singleton pattern)")
     
     def _detect_image_format(self, image_path: str) -> str:
         """Detect actual image format from file content (magic bytes)"""
@@ -1237,141 +1240,142 @@ Return in JSON format:
             logger.error(f"Error parsing JPEG dimensions: {e}")
             raise ValueError(f"Could not find JPEG dimensions: {e}")
     
-    def _validate_document_image(self, image_path: str) -> Dict[str, Any]:
-        """
-        Validate if an image is a valid document using zero-shot classification.
-        
-        Uses the shared singleton CLIP classifier (model loads only once).
-        
-        Args:
-            image_path: Path to the image file
-            
-        Returns:
-            Dict with validation results:
-            - validation_status: "valid" | "failed" | "need_review"
-            - validation_confidence: float score from classifier
-            - validation_label: string label from classifier
-            - error: optional error message
-        """
-        # Get the shared singleton classifier (loads only once on first call)
-        clip_classifier = _get_clip_classifier()
-        
-        # Check if classifier is available
-        if not clip_classifier:
-            logger.warning("CLIP classifier not available - SKIPPING validation and allowing document to proceed")
-            logger.warning("This may happen if HuggingFace models cannot be downloaded (network issues)")
-            return {
-                'validation_status': 'skipped',  # Skip validation if classifier unavailable
-                'validation_confidence': 1.0,  # High confidence to allow processing
-                'validation_label': 'classifier_unavailable',
-                'error': 'Image validation skipped - classifier not loaded'
-            }
-        
-        # Check if PIL is available for image loading
-        if not PIL_AVAILABLE:
-            logger.warning("PIL not available - SKIPPING validation and allowing document to proceed")
-            return {
-                'validation_status': 'skipped',  # Skip validation if PIL unavailable
-                'validation_confidence': 1.0,  # High confidence to allow processing
-                'validation_label': 'pil_unavailable',
-                'error': 'Image validation skipped - PIL not installed'
-            }
-        
-        try:
-            logger.info(f"Validating image with zero-shot classification: {image_path}")
-            
-            # Load image using PIL
-            try:
-                img = Image.open(image_path)
-                # Convert RGBA to RGB if needed
-                if img.mode in ['RGBA', 'LA', 'P']:
-                    rgb_img = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'P':
-                        img = img.convert('RGBA')
-                    rgb_img.paste(img, mask=img.split()[-1] if img.mode in ['RGBA', 'LA'] else None)
-                    img = rgb_img
-                elif img.mode != 'RGB':
-                    img = img.convert('RGB')
-            except Exception as e:
-                logger.error(f"Failed to load image for validation: {e}")
-                return {
-                    'validation_status': 'failed',  # Fail-safe: reject if can't load image
-                    'validation_confidence': 0.0,
-                    'validation_label': 'load_error',
-                    'error': f"Failed to load image for validation: {str(e)}"
-                }
-            
-            # Run zero-shot classification using the shared singleton classifier
-            try:
-                scores = clip_classifier(img, candidate_labels=self.VALIDATION_LABELS)
-                
-                # Get the top result
-                if not scores or len(scores) == 0:
-                    logger.error("Classifier returned empty results - REJECTING image")
-                    return {
-                        'validation_status': 'failed',  # Fail-safe: reject if no results
-                        'validation_confidence': 0.0,
-                        'validation_label': 'empty_results',
-                        'error': 'Classifier returned empty results'
-                    }
-                
-                top_result = scores[0]
-                label = top_result.get('label', '').strip()
-                score = float(top_result.get('score', 0.0))
-                
-                logger.info(f"Validation result: label='{label}', score={score:.4f}")
-                logger.info(f"All scores: {scores}")
-                
-                # Determine validation status based on confidence thresholds
-                # Check if label matches "Valid document" (case-insensitive)
-                is_valid_document_label = label.lower() == "valid document" or label.lower() == "valid_document"
-                
-                # Use the configured confidence threshold (0.90 = 90%)
-                confidence_threshold = self.CONFIDENCE_THRESHOLD
-                
-                if score < 0.40:
-                    # Image is NOT a document
-                    validation_status = 'failed'
-                    logger.warning(f"Image REJECTED: Confidence {score:.4f} < 0.40 (NOT a document)")
-                elif score < confidence_threshold:
-                    # Image might be a document but unclear - needs review
-                    validation_status = 'need_review'
-                    logger.warning(f"Image needs REVIEW: Confidence {score:.4f} between 0.40-{confidence_threshold:.2f} (unclear - requires {confidence_threshold*100:.0f}% for acceptance)")
-                else:
-                    # High confidence (>= threshold) - check if it's actually "Valid document"
-                    if is_valid_document_label:
-                        validation_status = 'valid'
-                        logger.info(f"Image ACCEPTED: Confidence {score:.4f} >= {confidence_threshold:.2f}, label='{label}' (Valid document)")
-                    else:
-                        # High confidence but wrong label (e.g., "other")
-                        validation_status = 'failed'
-                        logger.warning(f"Image REJECTED: High confidence {score:.4f} but wrong label '{label}' (not 'Valid document')")
-                
-                return {
-                    'validation_status': validation_status,
-                    'validation_confidence': score,
-                    'validation_label': label
-                }
-                
-            except Exception as e:
-                logger.error(f"Error during zero-shot classification: {e}")
-                logger.error("REJECTING image due to classification error (fail-safe mode)")
-                return {
-                    'validation_status': 'failed',  # Fail-safe: reject on classification error
-                    'validation_confidence': 0.0,
-                    'validation_label': 'classification_error',
-                    'error': f"Classification error: {str(e)}"
-                }
-                
-        except Exception as e:
-            logger.error(f"Unexpected error in image validation: {e}")
-            logger.error("REJECTING image due to unexpected error (fail-safe mode)")
-            return {
-                'validation_status': 'failed',  # Fail-safe: reject on unexpected error
-                'validation_confidence': 0.0,
-                'validation_label': 'unexpected_error',
-                'error': f"Unexpected error: {str(e)}"
-            }
+    # ZERO-SHOT VALIDATION TEMPORARILY DISABLED - Code preserved for future use
+    # def _validate_document_image(self, image_path: str) -> Dict[str, Any]:
+    #     """
+    #     Validate if an image is a valid document using zero-shot classification.
+    #     
+    #     Uses the shared singleton CLIP classifier (model loads only once).
+    #     
+    #     Args:
+    #         image_path: Path to the image file
+    #         
+    #     Returns:
+    #         Dict with validation results:
+    #         - validation_status: "valid" | "failed" | "need_review"
+    #         - validation_confidence: float score from classifier
+    #         - validation_label: string label from classifier
+    #         - error: optional error message
+    #     """
+    #     # Get the shared singleton classifier (loads only once on first call)
+    #     clip_classifier = _get_clip_classifier()
+    #     
+    #     # Check if classifier is available
+    #     if not clip_classifier:
+    #         logger.warning("CLIP classifier not available - SKIPPING validation and allowing document to proceed")
+    #         logger.warning("This may happen if HuggingFace models cannot be downloaded (network issues)")
+    #         return {
+    #             'validation_status': 'skipped',  # Skip validation if classifier unavailable
+    #             'validation_confidence': 1.0,  # High confidence to allow processing
+    #             'validation_label': 'classifier_unavailable',
+    #             'error': 'Image validation skipped - classifier not loaded'
+    #         }
+    #     
+    #     # Check if PIL is available for image loading
+    #     if not PIL_AVAILABLE:
+    #         logger.warning("PIL not available - SKIPPING validation and allowing document to proceed")
+    #         return {
+    #             'validation_status': 'skipped',  # Skip validation if PIL unavailable
+    #             'validation_confidence': 1.0,  # High confidence to allow processing
+    #             'validation_label': 'pil_unavailable',
+    #             'error': 'Image validation skipped - PIL not installed'
+    #         }
+    #     
+    #     try:
+    #         logger.info(f"Validating image with zero-shot classification: {image_path}")
+    #         
+    #         # Load image using PIL
+    #         try:
+    #             img = Image.open(image_path)
+    #             # Convert RGBA to RGB if needed
+    #             if img.mode in ['RGBA', 'LA', 'P']:
+    #                 rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+    #                 if img.mode == 'P':
+    #                     img = img.convert('RGBA')
+    #                 rgb_img.paste(img, mask=img.split()[-1] if img.mode in ['RGBA', 'LA'] else None)
+    #                 img = rgb_img
+    #             elif img.mode != 'RGB':
+    #                 img = img.convert('RGB')
+    #         except Exception as e:
+    #             logger.error(f"Failed to load image for validation: {e}")
+    #             return {
+    #                 'validation_status': 'failed',  # Fail-safe: reject if can't load image
+    #                 'validation_confidence': 0.0,
+    #                 'validation_label': 'load_error',
+    #                 'error': f"Failed to load image for validation: {str(e)}"
+    #             }
+    #         
+    #         # Run zero-shot classification using the shared singleton classifier
+    #         try:
+    #             scores = clip_classifier(img, candidate_labels=self.VALIDATION_LABELS)
+    #             
+    #             # Get the top result
+    #             if not scores or len(scores) == 0:
+    #                 logger.error("Classifier returned empty results - REJECTING image")
+    #                 return {
+    #                     'validation_status': 'failed',  # Fail-safe: reject if no results
+    #                     'validation_confidence': 0.0,
+    #                     'validation_label': 'empty_results',
+    #                     'error': 'Classifier returned empty results'
+    #                 }
+    #             
+    #             top_result = scores[0]
+    #             label = top_result.get('label', '').strip()
+    #             score = float(top_result.get('score', 0.0))
+    #             
+    #             logger.info(f"Validation result: label='{label}', score={score:.4f}")
+    #             logger.info(f"All scores: {scores}")
+    #             
+    #             # Determine validation status based on confidence thresholds
+    #             # Check if label matches "Valid document" (case-insensitive)
+    #             is_valid_document_label = label.lower() == "valid document" or label.lower() == "valid_document"
+    #             
+    #             # Use the configured confidence threshold (0.90 = 90%)
+    #             confidence_threshold = self.CONFIDENCE_THRESHOLD
+    #             
+    #             if score < 0.40:
+    #                 # Image is NOT a document
+    #                 validation_status = 'failed'
+    #                 logger.warning(f"Image REJECTED: Confidence {score:.4f} < 0.40 (NOT a document)")
+    #             elif score < confidence_threshold:
+    #                 # Image might be a document but unclear - needs review
+    #                 validation_status = 'need_review'
+    #                 logger.warning(f"Image needs REVIEW: Confidence {score:.4f} between 0.40-{confidence_threshold:.2f} (unclear - requires {confidence_threshold*100:.0f}% for acceptance)")
+    #             else:
+    #                 # High confidence (>= threshold) - check if it's actually "Valid document"
+    #                 if is_valid_document_label:
+    #                     validation_status = 'valid'
+    #                     logger.info(f"Image ACCEPTED: Confidence {score:.4f} >= {confidence_threshold:.2f}, label='{label}' (Valid document)")
+    #                 else:
+    #                     # High confidence but wrong label (e.g., "other")
+    #                     validation_status = 'failed'
+    #                     logger.warning(f"Image REJECTED: High confidence {score:.4f} but wrong label '{label}' (not 'Valid document')")
+    #             
+    #             return {
+    #                 'validation_status': validation_status,
+    #                 'validation_confidence': score,
+    #                 'validation_label': label
+    #             }
+    #             
+    #         except Exception as e:
+    #             logger.error(f"Error during zero-shot classification: {e}")
+    #             logger.error("REJECTING image due to classification error (fail-safe mode)")
+    #             return {
+    #                 'validation_status': 'failed',  # Fail-safe: reject on classification error
+    #                 'validation_confidence': 0.0,
+    #                 'validation_label': 'classification_error',
+    #                 'error': f"Classification error: {str(e)}"
+    #             }
+    #             
+    #     except Exception as e:
+    #         logger.error(f"Unexpected error in image validation: {e}")
+    #         logger.error("REJECTING image due to unexpected error (fail-safe mode)")
+    #         return {
+    #             'validation_status': 'failed',  # Fail-safe: reject on unexpected error
+    #             'validation_confidence': 0.0,
+    #             'validation_label': 'unexpected_error',
+    #             'error': f"Unexpected error: {str(e)}"
+    #         }
     
     def process_document(self, image_path: str, original_filename: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -1390,68 +1394,77 @@ Return in JSON format:
             file_ext = os.path.splitext(image_path)[1].lower()
             is_pdf = file_ext == '.pdf'
             
+            # ZERO-SHOT VALIDATION TEMPORARILY DISABLED - Code preserved for future use
             # Step 0: Zero-shot image validation (skip for PDFs)
-            validation_result = {
-                'validation_status': 'valid',
-                'validation_confidence': 1.0,
-                'validation_label': 'skipped'
-            }
+            # validation_result = {
+            #     'validation_status': 'valid',
+            #     'validation_confidence': 1.0,
+            #     'validation_label': 'skipped'
+            # }
+            # 
+            # if not is_pdf:
+            #     # Only validate image files, skip PDFs
+            #     image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+            #     if any(file_ext == ext for ext in image_extensions):
+            #         logger.info(f"🔍 Running zero-shot image validation for: {original_filename or image_path}")
+            #         logger.info(f"   File extension: {file_ext}")
+            #         validation_result = self._validate_document_image(image_path)
+            #         validation_status = validation_result.get('validation_status', 'valid')
+            #         validation_confidence = validation_result.get('validation_confidence', 1.0)
+            #         validation_label = validation_result.get('validation_label', '')
+            #         
+            #         logger.info(f"✅ Validation completed: status={validation_status}, confidence={validation_confidence:.4f}, label={validation_label}")
+            #         
+            #         # Handle skipped validation (classifier unavailable)
+            #         if validation_status == 'skipped':
+            #             logger.warning(f"Image validation skipped: {validation_label} - proceeding with document processing")
+            #             # Continue processing - don't return early
+            #         
+            #         # Handle failed validation (< 0.40)
+            #         elif validation_status == 'failed':
+            #             logger.warning(f"Image validation failed: Image is NOT a document (confidence: {validation_confidence:.4f})")
+            #             return {
+            #                 'success': False,
+            #                 'error': f'Image is not a valid document (confidence: {validation_confidence:.4f})',
+            #                 'validation_status': 'failed',
+            #                 'validation_confidence': validation_confidence,
+            #                 'validation_label': validation_label,
+            #                 'document_type': 'Invalid',
+            #                 'classification': 'UNKNOWN',
+            #                 'ocr_text': None,
+            #                 'extracted_data': {}
+            #             }
+            #         
+            #         # Handle need_review status (0.40 - 0.90)
+            #         elif validation_status == 'need_review':
+            #             logger.warning(f"Image validation: Needs human review (confidence: {validation_confidence:.4f})")
+            #             return {
+            #                 'success': False,
+            #                 'error': f'Image might be a document but requires review (confidence: {validation_confidence:.4f})',
+            #                 'validation_status': 'need_review',
+            #                 'validation_confidence': validation_confidence,
+            #                 'validation_label': validation_label,
+            #                 'document_type': 'Unclear',
+            #                 'classification': 'UNKNOWN',
+            #                 'ocr_text': None,
+            #                 'extracted_data': {}
+            #             }
+            #         
+            #         # If validation passed (>= 0.90 and "Valid document"), continue processing
+            #         else:
+            #             logger.info("✅ Image validation PASSED - proceeding with OCR and classification")
+            #     else:
+            #         logger.info(f"Skipping validation for file type: {file_ext}")
+            # else:
+            #     logger.info("Skipping validation for PDF file")
             
-            if not is_pdf:
-                # Only validate image files, skip PDFs
-                image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-                if any(file_ext == ext for ext in image_extensions):
-                    logger.info(f"🔍 Running zero-shot image validation for: {original_filename or image_path}")
-                    logger.info(f"   File extension: {file_ext}")
-                    validation_result = self._validate_document_image(image_path)
-                    validation_status = validation_result.get('validation_status', 'valid')
-                    validation_confidence = validation_result.get('validation_confidence', 1.0)
-                    validation_label = validation_result.get('validation_label', '')
-                    
-                    logger.info(f"✅ Validation completed: status={validation_status}, confidence={validation_confidence:.4f}, label={validation_label}")
-                    
-                    # Handle skipped validation (classifier unavailable)
-                    if validation_status == 'skipped':
-                        logger.warning(f"Image validation skipped: {validation_label} - proceeding with document processing")
-                        # Continue processing - don't return early
-                    
-                    # Handle failed validation (< 0.40)
-                    elif validation_status == 'failed':
-                        logger.warning(f"Image validation failed: Image is NOT a document (confidence: {validation_confidence:.4f})")
-                        return {
-                            'success': False,
-                            'error': f'Image is not a valid document (confidence: {validation_confidence:.4f})',
-                            'validation_status': 'failed',
-                            'validation_confidence': validation_confidence,
-                            'validation_label': validation_label,
-                            'document_type': 'Invalid',
-                            'classification': 'UNKNOWN',
-                            'ocr_text': None,
-                            'extracted_data': {}
-                        }
-                    
-                    # Handle need_review status (0.40 - 0.90)
-                    elif validation_status == 'need_review':
-                        logger.warning(f"Image validation: Needs human review (confidence: {validation_confidence:.4f})")
-                        return {
-                            'success': False,
-                            'error': f'Image might be a document but requires review (confidence: {validation_confidence:.4f})',
-                            'validation_status': 'need_review',
-                            'validation_confidence': validation_confidence,
-                            'validation_label': validation_label,
-                            'document_type': 'Unclear',
-                            'classification': 'UNKNOWN',
-                            'ocr_text': None,
-                            'extracted_data': {}
-                        }
-                    
-                    # If validation passed (>= 0.90 and "Valid document"), continue processing
-                    else:
-                        logger.info("✅ Image validation PASSED - proceeding with OCR and classification")
-                else:
-                    logger.info(f"Skipping validation for file type: {file_ext}")
-            else:
-                logger.info("Skipping validation for PDF file")
+            # Skip validation - always proceed with processing
+            validation_result = {
+                'validation_status': 'skipped',
+                'validation_confidence': 1.0,
+                'validation_label': 'validation_disabled'
+            }
+            logger.info("Zero-shot validation disabled - proceeding with document processing")
             
             if file_ext == '.pdf':
                 logger.info("Processing PDF directly via Claude API")
