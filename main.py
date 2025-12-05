@@ -6535,6 +6535,260 @@ async def get_property_agent(property_id: str):
         logger.error(f"Error getting property agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Agents API Endpoints
+
+@app.get("/api/agents")
+async def list_agents(
+    page: int = 1,
+    page_size: int = 20,
+    cursor: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """List all agents with pagination"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        agents, total = firestore_service.list_agents(
+            page=page,
+            page_size=page_size,
+            cursor_doc_id=cursor
+        )
+        return JSONResponse(content={
+            "success": True,
+            "agents": convert_decimals(agents),
+            "total": total,
+            "page": page,
+            "page_size": page_size
+        })
+    except Exception as e:
+        logger.error(f"Error listing agents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/agents")
+async def create_agent(
+    agent_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Create a new agent"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        agent_id = str(uuid.uuid4())
+        agent_data['id'] = agent_id
+        firestore_service.create_agent(agent_id, agent_data)
+        return JSONResponse(content={
+            "success": True,
+            "agent_id": agent_id,
+            "agent": convert_decimals(agent_data)
+        })
+    except Exception as e:
+        logger.error(f"Error creating agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/agents/{agent_id}")
+async def get_agent(agent_id: str):
+    """Get agent details"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        agent = firestore_service.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return JSONResponse(content={
+            "success": True,
+            "agent": convert_decimals(agent)
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/agents/{agent_id}")
+async def update_agent(
+    agent_id: str,
+    agent_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Update an agent"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        success = firestore_service.update_agent(agent_id, agent_data)
+        if not success:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return JSONResponse(content={
+            "success": True,
+            "message": "Agent updated successfully"
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/agents/{agent_id}")
+async def delete_agent(
+    agent_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Delete an agent"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        success = firestore_service.delete_agent(agent_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return JSONResponse(content={
+            "success": True,
+            "message": "Agent deleted successfully"
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Deals API Endpoints
+
+@app.get("/api/deals")
+async def list_deals(
+    page: int = 1,
+    page_size: int = 20,
+    cursor: Optional[str] = None,
+    agentId: Optional[str] = None,
+    clientId: Optional[str] = None,
+    propertyId: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """List all deals with filters and pagination"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        deals, total = firestore_service.list_deals(
+            page=page,
+            page_size=page_size,
+            agent_id=agentId,
+            client_id=clientId,
+            property_id=propertyId,
+            status=status,
+            cursor_doc_id=cursor
+        )
+        return JSONResponse(content={
+            "success": True,
+            "deals": convert_decimals(deals),
+            "total": total,
+            "page": page,
+            "page_size": page_size
+        })
+    except Exception as e:
+        logger.error(f"Error listing deals: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/deals")
+async def create_deal(
+    deal_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Create a new deal"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        deal_id = str(uuid.uuid4())
+        deal_data['id'] = deal_id
+        firestore_service.create_deal(deal_id, deal_data)
+        return JSONResponse(content={
+            "success": True,
+            "deal_id": deal_id,
+            "deal": convert_decimals(deal_data)
+        })
+    except Exception as e:
+        logger.error(f"Error creating deal: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/deals/{deal_id}")
+async def get_deal(deal_id: str):
+    """Get deal details"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        deal = firestore_service.get_deal(deal_id)
+        if not deal:
+            raise HTTPException(status_code=404, detail="Deal not found")
+        
+        # Optionally enrich with related data
+        documents = firestore_service.get_documents_by_deal(deal_id, page=1, page_size=100)[0]
+        property_files = firestore_service.get_property_files_by_deal(deal_id)
+        
+        deal['documents'] = convert_decimals(documents)
+        deal['property_files'] = convert_decimals(property_files)
+        
+        return JSONResponse(content={
+            "success": True,
+            "deal": convert_decimals(deal)
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting deal: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/deals/{deal_id}")
+async def update_deal(
+    deal_id: str,
+    deal_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Update a deal"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        success = firestore_service.update_deal(deal_id, deal_data)
+        if not success:
+            raise HTTPException(status_code=404, detail="Deal not found")
+        return JSONResponse(content={
+            "success": True,
+            "message": "Deal updated successfully"
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating deal: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/deals/{deal_id}")
+async def delete_deal(
+    deal_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Delete a deal"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore not available")
+    
+    try:
+        success = firestore_service.delete_deal(deal_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Deal not found")
+        return JSONResponse(content={
+            "success": True,
+            "message": "Deal deleted successfully"
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting deal: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Agent Query Endpoints
 
 @app.get("/api/agents/{agent_id}/properties")

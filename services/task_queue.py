@@ -638,6 +638,19 @@ class TaskQueue:
                 
                 self.firestore_service.update_property_file(property_file_id, update_data)
                 
+                # Create or find deal for this agent + client + property combination
+                deal = None
+                if agent_id and client_id and property_id:
+                    deal = self.firestore_service.find_or_create_deal(
+                        agent_id=agent_id,
+                        client_id=client_id,
+                        property_id=property_id,
+                        deal_type=transaction_type,
+                        stage='LEAD'
+                    )
+                    if deal:
+                        logger.info(f"Created/found deal {deal.get('id')} for agent {agent_id}, client {client_id}, property {property_id}")
+                
                 # Update document status with all relationships
                 document_update = {
                     'client_id': client_id,
@@ -646,12 +659,22 @@ class TaskQueue:
                 }
                 if property_id:
                     document_update['property_id'] = property_id
+                if deal:
+                    document_update['dealId'] = deal.get('id')
                 self.firestore_service.update_document(document_id, document_update)
                 
-                # Update property file with agent_id if not set
+                # Update property file with agent_id and dealId if not set
+                property_file_update = {}
                 if agent_id and not property_file.get('agent_id'):
-                    self.firestore_service.update_property_file(property_file_id, {'agent_id': agent_id})
-                    logger.info(f"Updated property file {property_file_id} with agent_id {agent_id}")
+                    property_file_update['agent_id'] = agent_id
+                if deal and not property_file.get('dealId'):
+                    property_file_update['dealId'] = deal.get('id')
+                if property_file_update:
+                    self.firestore_service.update_property_file(property_file_id, property_file_update)
+                    if agent_id:
+                        logger.info(f"Updated property file {property_file_id} with agent_id {agent_id}")
+                    if deal:
+                        logger.info(f"Updated property file {property_file_id} with dealId {deal.get('id')}")
                 
                 logger.info(f"Attached {document_type} document {document_id} to existing property file {property_file_id}")
                 if is_id_document:
@@ -705,6 +728,19 @@ class TaskQueue:
         if document:
             agent_id = document.get('agentId') or document.get('agent_id')
         
+        # Create or find deal for this agent + client + property combination
+        deal = None
+        if agent_id and client_id and property_id:
+            deal = self.firestore_service.find_or_create_deal(
+                agent_id=agent_id,
+                client_id=client_id,
+                property_id=property_id,
+                deal_type=transaction_type,
+                stage='LEAD'
+            )
+            if deal:
+                logger.info(f"Created/found deal {deal.get('id')} for agent {agent_id}, client {client_id}, property {property_id}")
+        
         # Create new property file
         property_file_id = str(uuid.uuid4())
         property_file_data = {
@@ -718,9 +754,11 @@ class TaskQueue:
             'created_from_document_type': doc_type_normalized  # Track which document type created this
         }
         
-        # Add agent_id to property file
+        # Add agent_id and dealId to property file
         if agent_id:
             property_file_data['agent_id'] = agent_id
+        if deal:
+            property_file_data['dealId'] = deal.get('id')
         
         # Set the appropriate document field based on type
         property_file_data[doc_type_key] = document_id
@@ -735,6 +773,8 @@ class TaskQueue:
         }
         if property_id:
             document_update['property_id'] = property_id
+        if deal:
+            document_update['dealId'] = deal.get('id')
         self.firestore_service.update_document(document_id, document_update)
         
         logger.info(f"Successfully created property file {property_file_id} from {document_type} document {document_id}")

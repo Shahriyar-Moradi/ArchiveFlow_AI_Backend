@@ -28,6 +28,8 @@ class FirestoreService:
             self.clients_collection = self.db.collection('clients')
             self.properties_collection = self.db.collection('properties')
             self.property_files_collection = self.db.collection('property_files')
+            self.agents_collection = self.db.collection('agents')
+            self.deals_collection = self.db.collection('deals')
             logger.info(f"Firestore client initialized for project: {settings.FIRESTORE_PROJECT_ID}")
         except Exception as e:
             logger.error(f"Failed to initialize Firestore client: {e}")
@@ -140,6 +142,8 @@ class FirestoreService:
                     query = query.where(filter=FieldFilter('propertyId', '==', filters['propertyId']))
                 if filters.get('clientId'):
                     query = query.where(filter=FieldFilter('clientId', '==', filters['clientId']))
+                if filters.get('dealId'):
+                    query = query.where(filter=FieldFilter('dealId', '==', filters['dealId']))
             
             # Order by created_at descending
             query = query.order_by('created_at', direction=Query.DESCENDING)
@@ -218,6 +222,8 @@ class FirestoreService:
                 query = query.where(filter=FieldFilter('propertyId', '==', search_params['propertyId']))
             if search_params.get('clientId'):
                 query = query.where(filter=FieldFilter('clientId', '==', search_params['clientId']))
+            if search_params.get('dealId'):
+                query = query.where(filter=FieldFilter('dealId', '==', search_params['dealId']))
             
             # Order by created_at descending
             query = query.order_by('created_at', direction=Query.DESCENDING)
@@ -529,6 +535,49 @@ class FirestoreService:
                     
         except Exception as e:
             logger.error(f"Failed to get documents by flow_id: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return [], 0
+    
+    def get_documents_by_deal(
+        self,
+        deal_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        cursor_doc_id: Optional[str] = None
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Get documents by deal_id with efficient cursor-based pagination"""
+        try:
+            # Build query with filter and ordering
+            query = self.documents_collection.where(filter=FieldFilter('dealId', '==', deal_id))
+            query = query.order_by('created_at', direction=Query.DESCENDING)
+            
+            # Use cursor-based pagination if cursor provided (more efficient than offset)
+            if cursor_doc_id:
+                cursor_doc = self.documents_collection.document(cursor_doc_id).get()
+                if cursor_doc.exists:
+                    query = query.start_after(cursor_doc)
+            elif page > 1:
+                # Fallback to offset for first-time pagination without cursor
+                offset = (page - 1) * page_size
+                query = query.offset(offset)
+            
+            # Fetch documents with limit
+            docs = list(query.limit(page_size).stream())
+            
+            documents = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['document_id'] = doc.id
+                documents.append(data)
+            
+            # For total count, return -1 (expensive to compute)
+            total = -1
+            
+            return documents, total
+                    
+        except Exception as e:
+            logger.error(f"Failed to get documents by deal_id: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return [], 0
@@ -946,6 +995,7 @@ class FirestoreService:
         property_id: Optional[str] = None,
         status: Optional[str] = None,
         transaction_type: Optional[str] = None,
+        deal_id: Optional[str] = None,
         cursor_doc_id: Optional[str] = None
     ) -> tuple[List[Dict[str, Any]], int]:
         """List property files with filters and pagination"""
@@ -957,6 +1007,8 @@ class FirestoreService:
                 query = query.where(filter=FieldFilter('client_id', '==', client_id))
             if property_id:
                 query = query.where(filter=FieldFilter('property_id', '==', property_id))
+            if deal_id:
+                query = query.where(filter=FieldFilter('dealId', '==', deal_id))
             if status:
                 # Normalize status to uppercase to ensure case-insensitive matching
                 status_normalized = status.upper() if isinstance(status, str) else status
@@ -1086,6 +1138,25 @@ class FirestoreService:
             return property_files
         except Exception as e:
             logger.error(f"Failed to get property files by property: {e}")
+            return []
+    
+    def get_property_files_by_deal(self, deal_id: str) -> List[Dict[str, Any]]:
+        """Get all property files for a deal"""
+        try:
+            query = self.property_files_collection.where(
+                filter=FieldFilter('dealId', '==', deal_id)
+            ).order_by('created_at', direction=Query.DESCENDING)
+            
+            docs = list(query.stream())
+            property_files = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                property_files.append(data)
+            
+            return property_files
+        except Exception as e:
+            logger.error(f"Failed to get property files by deal: {e}")
             return []
     
     def find_matching_property_file(
@@ -1243,31 +1314,67 @@ class FirestoreService:
         agent_id: str,
         page: int = 1,
         page_size: int = 20,
-        cursor_doc_id: Optional[str] = None
+        cursor_doc_id: Optional[str] = None,
+        use_deals: bool = False
     ) -> tuple[List[Dict[str, Any]], int]:
-        """List all properties managed by a specific agent"""
+        """
+        List all properties managed by a specific agent.
+        If use_deals=True, uses deals collection for more accurate results (properties with active deals).
+        Otherwise, uses properties collection directly (properties where agentId is set).
+        """
         try:
-            query = self.properties_collection.where(
-                filter=FieldFilter('agentId', '==', agent_id)
-            ).order_by('created_at', direction=Query.DESCENDING)
-            
-            if cursor_doc_id:
-                cursor_doc = self.properties_collection.document(cursor_doc_id).get()
-                if cursor_doc.exists:
-                    query = query.start_after(cursor_doc)
-            elif page > 1:
-                offset = (page - 1) * page_size
-                query = query.offset(offset)
-            
-            docs = list(query.limit(page_size).stream())
-            properties = []
-            for doc in docs:
-                data = doc.to_dict()
-                data['id'] = doc.id
-                properties.append(data)
-            
-            total = -1
-            return properties, total
+            if use_deals:
+                # Use deals collection to find properties with active deals for this agent
+                deals = self.get_deals_by_agent(agent_id)
+                property_ids = set()
+                for deal in deals:
+                    property_id = deal.get('propertyId')
+                    if property_id:
+                        property_ids.add(property_id)
+                
+                if not property_ids:
+                    return [], 0
+                
+                # Fetch properties by IDs
+                properties = []
+                for property_id in property_ids:
+                    prop = self.get_property(property_id)
+                    if prop:
+                        properties.append(prop)
+                
+                # Sort by created_at descending
+                properties.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
+                
+                # Apply pagination
+                start_idx = (page - 1) * page_size
+                end_idx = start_idx + page_size
+                paginated_properties = properties[start_idx:end_idx]
+                
+                total = len(properties)
+                return paginated_properties, total
+            else:
+                # Original method: query properties collection directly
+                query = self.properties_collection.where(
+                    filter=FieldFilter('agentId', '==', agent_id)
+                ).order_by('created_at', direction=Query.DESCENDING)
+                
+                if cursor_doc_id:
+                    cursor_doc = self.properties_collection.document(cursor_doc_id).get()
+                    if cursor_doc.exists:
+                        query = query.start_after(cursor_doc)
+                elif page > 1:
+                    offset = (page - 1) * page_size
+                    query = query.offset(offset)
+                
+                docs = list(query.limit(page_size).stream())
+                properties = []
+                for doc in docs:
+                    data = doc.to_dict()
+                    data['id'] = doc.id
+                    properties.append(data)
+                
+                total = -1
+                return properties, total
         except Exception as e:
             logger.error(f"Failed to list properties by agent: {e}")
             return [], 0
@@ -1279,27 +1386,22 @@ class FirestoreService:
         page_size: int = 20,
         cursor_doc_id: Optional[str] = None
     ) -> tuple[List[Dict[str, Any]], int]:
-        """List all clients related to documents uploaded by a specific agent"""
+        """List all clients related to deals for a specific agent (optimized using deals collection)"""
         try:
-            # First, get all documents by this agent
-            agent_docs_query = self.documents_collection.where(
-                filter=FieldFilter('agentId', '==', agent_id)
-            )
-            agent_docs = list(agent_docs_query.stream())
+            # Use deals collection for efficient querying
+            deals = self.get_deals_by_agent(agent_id)
             
-            # Extract unique client IDs from documents
+            # Extract unique client IDs from deals
             client_ids = set()
-            for doc in agent_docs:
-                data = doc.to_dict()
-                client_id = data.get('clientId')
+            for deal in deals:
+                client_id = deal.get('clientId')
                 if client_id:
                     client_ids.add(client_id)
             
             if not client_ids:
                 return [], 0
             
-            # Get clients by IDs (Firestore doesn't support 'in' queries efficiently for large sets)
-            # So we'll fetch all matching clients
+            # Get clients by IDs
             clients = []
             for client_id in client_ids:
                 client = self.get_client(client_id)
@@ -1368,33 +1470,53 @@ class FirestoreService:
             return None
     
     def get_client_properties(self, client_id: str) -> List[Dict[str, Any]]:
-        """Get all unique properties for a client through property files"""
+        """Get all unique properties for a client through deals (optimized)"""
         try:
-            # Get all property files for this client
-            property_files = self.get_property_files_by_client(client_id)
-            logger.info(f"Found {len(property_files)} property files by client_id for client {client_id}")
+            # Use deals collection for efficient querying
+            deals = self.get_deals_by_client(client_id)
             
-            # If no property files found by client_id, try searching by client_full_name as fallback
-            if not property_files:
-                client = self.get_client(client_id)
-                if client and client.get('full_name'):
-                    # Search property files by client_full_name
-                    try:
-                        query = self.property_files_collection.where(
-                            filter=FieldFilter('client_full_name', '==', client.get('full_name'))
-                        ).order_by('created_at', direction=Query.DESCENDING)
-                        docs = list(query.stream())
-                        property_files = []
-                        for doc in docs:
-                            data = doc.to_dict()
-                            data['id'] = doc.id
-                            property_files.append(data)
-                        logger.info(f"Found {len(property_files)} property files by client_full_name '{client.get('full_name')}' for client {client_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to search property files by client_full_name: {e}")
+            # Extract unique property IDs from deals
+            property_ids = set()
+            for deal in deals:
+                property_id = deal.get('propertyId')
+                if property_id:
+                    property_ids.add(property_id)
             
-            if not property_files:
-                logger.info(f"No property files found for client {client_id}")
+            if not property_ids:
+                # Fallback to property files if no deals found
+                property_files = self.get_property_files_by_client(client_id)
+                logger.info(f"Found {len(property_files)} property files by client_id for client {client_id}")
+                
+                # If no property files found by client_id, try searching by client_full_name as fallback
+                if not property_files:
+                    client = self.get_client(client_id)
+                    if client and client.get('full_name'):
+                        # Search property files by client_full_name
+                        try:
+                            query = self.property_files_collection.where(
+                                filter=FieldFilter('client_full_name', '==', client.get('full_name'))
+                            ).order_by('created_at', direction=Query.DESCENDING)
+                            docs = list(query.stream())
+                            property_files = []
+                            for doc in docs:
+                                data = doc.to_dict()
+                                data['id'] = doc.id
+                                property_files.append(data)
+                            logger.info(f"Found {len(property_files)} property files by client_full_name '{client.get('full_name')}' for client {client_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to search property files by client_full_name: {e}")
+                
+                if not property_files:
+                    logger.info(f"No property files found for client {client_id}")
+                    return []
+                
+                # Extract property IDs from property files
+                for pf in property_files:
+                    prop_id = pf.get('property_id')
+                    if prop_id:
+                        property_ids.add(prop_id)
+            
+            if not property_ids:
                 return []
             
             # Track property files with their IDs and references for fallback lookup
@@ -1602,5 +1724,297 @@ class FirestoreService:
             return client
         except Exception as e:
             logger.error(f"Failed to get client full: {e}")
+            return None
+    
+    # Agent Operations
+    
+    def create_agent(self, agent_id: str, data: Dict[str, Any]) -> str:
+        """Create a new agent record"""
+        try:
+            doc_ref = self.agents_collection.document(agent_id)
+            data['id'] = agent_id
+            data['created_at'] = firestore.SERVER_TIMESTAMP
+            data['updated_at'] = firestore.SERVER_TIMESTAMP
+            data.setdefault('status', 'ACTIVE')
+            doc_ref.set(data)
+            logger.info(f"Created agent record: {agent_id}")
+            return agent_id
+        except Exception as e:
+            logger.error(f"Failed to create agent record: {e}")
+            raise
+    
+    def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """Get an agent by ID"""
+        try:
+            doc_ref = self.agents_collection.document(agent_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get agent: {e}")
+            return None
+    
+    def list_agents(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        cursor_doc_id: Optional[str] = None
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """List agents with pagination"""
+        try:
+            query = self.agents_collection.order_by('created_at', direction=Query.DESCENDING)
+            
+            if cursor_doc_id:
+                cursor_doc = self.agents_collection.document(cursor_doc_id).get()
+                if cursor_doc.exists:
+                    query = query.start_after(cursor_doc)
+            elif page > 1:
+                offset = (page - 1) * page_size
+                query = query.offset(offset)
+            
+            docs = list(query.limit(page_size).stream())
+            agents = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                agents.append(data)
+            
+            total = -1
+            return agents, total
+        except Exception as e:
+            logger.error(f"Failed to list agents: {e}")
+            return [], 0
+    
+    def update_agent(self, agent_id: str, data: Dict[str, Any]) -> bool:
+        """Update an agent record"""
+        try:
+            doc_ref = self.agents_collection.document(agent_id)
+            data['updated_at'] = firestore.SERVER_TIMESTAMP
+            doc_ref.update(data)
+            logger.info(f"Updated agent record: {agent_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update agent record: {e}")
+            return False
+    
+    def delete_agent(self, agent_id: str) -> bool:
+        """Delete an agent record"""
+        try:
+            doc_ref = self.agents_collection.document(agent_id)
+            doc_ref.delete()
+            logger.info(f"Deleted agent record: {agent_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete agent record: {e}")
+            return False
+    
+    # Deal Operations
+    
+    def create_deal(self, deal_id: str, data: Dict[str, Any]) -> str:
+        """Create a new deal record"""
+        try:
+            doc_ref = self.deals_collection.document(deal_id)
+            data['id'] = deal_id
+            data['createdAt'] = firestore.SERVER_TIMESTAMP
+            data['updatedAt'] = firestore.SERVER_TIMESTAMP
+            data.setdefault('status', 'ACTIVE')
+            data.setdefault('stage', 'LEAD')
+            doc_ref.set(data)
+            logger.info(f"Created deal record: {deal_id}")
+            return deal_id
+        except Exception as e:
+            logger.error(f"Failed to create deal record: {e}")
+            raise
+    
+    def get_deal(self, deal_id: str) -> Optional[Dict[str, Any]]:
+        """Get a deal by ID"""
+        try:
+            doc_ref = self.deals_collection.document(deal_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get deal: {e}")
+            return None
+    
+    def list_deals(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        agent_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        property_id: Optional[str] = None,
+        status: Optional[str] = None,
+        cursor_doc_id: Optional[str] = None
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """List deals with filters and pagination"""
+        try:
+            query = self.deals_collection
+            
+            # Apply filters
+            if agent_id:
+                query = query.where(filter=FieldFilter('agentId', '==', agent_id))
+            if client_id:
+                query = query.where(filter=FieldFilter('clientId', '==', client_id))
+            if property_id:
+                query = query.where(filter=FieldFilter('propertyId', '==', property_id))
+            if status:
+                query = query.where(filter=FieldFilter('status', '==', status))
+            
+            query = query.order_by('createdAt', direction=Query.DESCENDING)
+            
+            if cursor_doc_id:
+                cursor_doc = self.deals_collection.document(cursor_doc_id).get()
+                if cursor_doc.exists:
+                    query = query.start_after(cursor_doc)
+            elif page > 1:
+                offset = (page - 1) * page_size
+                query = query.offset(offset)
+            
+            docs = list(query.limit(page_size).stream())
+            deals = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                deals.append(data)
+            
+            total = -1
+            return deals, total
+        except Exception as e:
+            logger.error(f"Failed to list deals: {e}")
+            return [], 0
+    
+    def update_deal(self, deal_id: str, data: Dict[str, Any]) -> bool:
+        """Update a deal record"""
+        try:
+            doc_ref = self.deals_collection.document(deal_id)
+            data['updatedAt'] = firestore.SERVER_TIMESTAMP
+            doc_ref.update(data)
+            logger.info(f"Updated deal record: {deal_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update deal record: {e}")
+            return False
+    
+    def delete_deal(self, deal_id: str) -> bool:
+        """Delete a deal record"""
+        try:
+            doc_ref = self.deals_collection.document(deal_id)
+            doc_ref.delete()
+            logger.info(f"Deleted deal record: {deal_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete deal record: {e}")
+            return False
+    
+    def get_deals_by_agent(self, agent_id: str) -> List[Dict[str, Any]]:
+        """Get all deals for a specific agent"""
+        try:
+            query = self.deals_collection.where(
+                filter=FieldFilter('agentId', '==', agent_id)
+            ).order_by('createdAt', direction=Query.DESCENDING)
+            
+            docs = list(query.stream())
+            deals = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                deals.append(data)
+            
+            return deals
+        except Exception as e:
+            logger.error(f"Failed to get deals by agent: {e}")
+            return []
+    
+    def get_deals_by_client(self, client_id: str) -> List[Dict[str, Any]]:
+        """Get all deals for a specific client"""
+        try:
+            query = self.deals_collection.where(
+                filter=FieldFilter('clientId', '==', client_id)
+            ).order_by('createdAt', direction=Query.DESCENDING)
+            
+            docs = list(query.stream())
+            deals = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                deals.append(data)
+            
+            return deals
+        except Exception as e:
+            logger.error(f"Failed to get deals by client: {e}")
+            return []
+    
+    def get_deals_by_property(self, property_id: str) -> List[Dict[str, Any]]:
+        """Get all deals for a specific property"""
+        try:
+            query = self.deals_collection.where(
+                filter=FieldFilter('propertyId', '==', property_id)
+            ).order_by('createdAt', direction=Query.DESCENDING)
+            
+            docs = list(query.stream())
+            deals = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                deals.append(data)
+            
+            return deals
+        except Exception as e:
+            logger.error(f"Failed to get deals by property: {e}")
+            return []
+    
+    def find_or_create_deal(
+        self,
+        agent_id: str,
+        client_id: str,
+        property_id: str,
+        deal_type: Optional[str] = None,
+        stage: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Find existing deal or create a new one for the given agent, client, and property combination"""
+        try:
+            # First, try to find existing deal
+            query = self.deals_collection.where(
+                filter=FieldFilter('agentId', '==', agent_id)
+            ).where(
+                filter=FieldFilter('clientId', '==', client_id)
+            ).where(
+                filter=FieldFilter('propertyId', '==', property_id)
+            ).where(
+                filter=FieldFilter('status', '==', 'ACTIVE')
+            ).limit(1)
+            
+            existing_deals = list(query.stream())
+            if existing_deals:
+                deal_doc = existing_deals[0]
+                data = deal_doc.to_dict()
+                data['id'] = deal_doc.id
+                logger.info(f"Found existing deal: {deal_doc.id}")
+                return data
+            
+            # Create new deal if not found
+            import uuid
+            deal_id = f"deal_{uuid.uuid4().hex[:12]}"
+            deal_data = {
+                'agentId': agent_id,
+                'clientId': client_id,
+                'propertyId': property_id,
+                'dealType': deal_type or 'RENT',
+                'stage': stage or 'LEAD',
+                'status': 'ACTIVE'
+            }
+            
+            self.create_deal(deal_id, deal_data)
+            logger.info(f"Created new deal: {deal_id}")
+            return self.get_deal(deal_id)
+        except Exception as e:
+            logger.error(f"Failed to find or create deal: {e}")
             return None
 
