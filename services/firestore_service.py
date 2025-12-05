@@ -15,6 +15,24 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _get_query_count(query: Query) -> int:
+    """Return the total number of documents for a query using aggregation.
+
+    Firestore's count aggregation avoids loading all documents just to compute totals.
+    If the aggregation fails (e.g., emulator/old SDK), we fall back to -1 to signal
+    that the count is unavailable without expensive scans.
+    """
+
+    try:
+        count_query = query.count()
+        results = count_query.get()
+        if results and results[0] and hasattr(results[0][0], "value"):
+            return int(results[0][0].value)
+    except Exception as e:
+        logger.warning(f"Count aggregation failed: {e}")
+    return -1
+
 class FirestoreService:
     """Service for interacting with Firestore database"""
     
@@ -786,7 +804,11 @@ class FirestoreService:
     ) -> tuple[List[Dict[str, Any]], int]:
         """List clients with pagination"""
         try:
-            query = self.clients_collection.order_by('created_at', direction=Query.DESCENDING)
+            base_query = self.clients_collection.order_by('created_at', direction=Query.DESCENDING)
+
+            total = _get_query_count(base_query)
+
+            query = base_query
             
             if cursor_doc_id:
                 cursor_doc = self.clients_collection.document(cursor_doc_id).get()
@@ -803,7 +825,6 @@ class FirestoreService:
                 data['id'] = doc.id
                 clients.append(data)
             
-            total = -1
             return clients, total
         except Exception as e:
             logger.error(f"Failed to list clients: {e}")
@@ -907,11 +928,15 @@ class FirestoreService:
         """List properties with pagination and optional agent filter"""
         try:
             if agent_id:
-                query = self.properties_collection.where(
+                base_query = self.properties_collection.where(
                     filter=FieldFilter('agentId', '==', agent_id)
                 ).order_by('created_at', direction=Query.DESCENDING)
             else:
-                query = self.properties_collection.order_by('created_at', direction=Query.DESCENDING)
+                base_query = self.properties_collection.order_by('created_at', direction=Query.DESCENDING)
+
+            total = _get_query_count(base_query)
+
+            query = base_query
             
             if cursor_doc_id:
                 cursor_doc = self.properties_collection.document(cursor_doc_id).get()
@@ -928,7 +953,6 @@ class FirestoreService:
                 data['id'] = doc.id
                 properties.append(data)
             
-            total = -1
             return properties, total
         except Exception as e:
             logger.error(f"Failed to list properties: {e}")
@@ -1354,9 +1378,13 @@ class FirestoreService:
                 return paginated_properties, total
             else:
                 # Original method: query properties collection directly
-                query = self.properties_collection.where(
+                base_query = self.properties_collection.where(
                     filter=FieldFilter('agentId', '==', agent_id)
                 ).order_by('created_at', direction=Query.DESCENDING)
+
+                total = _get_query_count(base_query)
+
+                query = base_query
                 
                 if cursor_doc_id:
                     cursor_doc = self.properties_collection.document(cursor_doc_id).get()
@@ -1373,7 +1401,6 @@ class FirestoreService:
                     data['id'] = doc.id
                     properties.append(data)
                 
-                total = -1
                 return properties, total
         except Exception as e:
             logger.error(f"Failed to list properties by agent: {e}")
@@ -1765,7 +1792,11 @@ class FirestoreService:
     ) -> tuple[List[Dict[str, Any]], int]:
         """List agents with pagination"""
         try:
-            query = self.agents_collection.order_by('created_at', direction=Query.DESCENDING)
+            base_query = self.agents_collection.order_by('created_at', direction=Query.DESCENDING)
+
+            total = _get_query_count(base_query)
+
+            query = base_query
             
             if cursor_doc_id:
                 cursor_doc = self.agents_collection.document(cursor_doc_id).get()
@@ -1782,7 +1813,6 @@ class FirestoreService:
                 data['id'] = doc.id
                 agents.append(data)
             
-            total = -1
             return agents, total
         except Exception as e:
             logger.error(f"Failed to list agents: {e}")
