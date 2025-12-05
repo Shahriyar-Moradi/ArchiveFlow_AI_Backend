@@ -415,17 +415,17 @@ class CORSResponseMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         
         # Add CORS headers to all responses
-        if origin and origin in allowed_origins:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        elif not origin:
-            # If no origin header, allow all (for non-browser clients)
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        else:
-            # Even if origin is not in allowed_origins, add headers for error responses
+        # IMPORTANT: When allow_credentials=True, we cannot use "*" for Access-Control-Allow-Origin
+        # We must use the specific origin
+        if origin:
+            # Always use the origin (even if not in allowed_origins for error responses)
             # This ensures CORS errors don't mask the actual error
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+            # No origin header - for non-browser clients, we can use "*"
+            # But this should be rare in browser contexts
+            response.headers["Access-Control-Allow-Origin"] = "*"
         
         # Add other CORS headers
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
@@ -1026,24 +1026,39 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
 
 @app.options("/{full_path:path}")
 async def options_handler(request: Request, full_path: str):
-    """Handle OPTIONS preflight requests for all routes"""
+    """Handle OPTIONS preflight requests for all routes - ensures CORS headers are always present"""
     origin = request.headers.get("origin")
     
-    cors_headers = {}
-    if origin and origin in allowed_origins:
-        cors_headers["Access-Control-Allow-Origin"] = origin
-        cors_headers["Access-Control-Allow-Credentials"] = "true"
-    elif not origin:
-        cors_headers["Access-Control-Allow-Origin"] = "*"
-    else:
-        # Even if origin is not in allowed_origins, respond to preflight
-        cors_headers["Access-Control-Allow-Origin"] = origin
-        cors_headers["Access-Control-Allow-Credentials"] = "true"
+    # Get the requested headers from the preflight request
+    requested_headers = request.headers.get("access-control-request-headers", "*")
+    requested_method = request.headers.get("access-control-request-method", "GET")
     
+    cors_headers = {}
+    
+    # When allow_credentials=True, we cannot use "*" for Access-Control-Allow-Origin
+    # We must use the specific origin or not set it at all
+    if origin:
+        # Always allow the origin in preflight (even if not in allowed_origins)
+        # This ensures CORS errors don't block the preflight
+        if origin in allowed_origins:
+            cors_headers["Access-Control-Allow-Origin"] = origin
+            cors_headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+            # Still respond to preflight even if origin not in allowed list
+            # The actual request will be blocked, but preflight should succeed
+            cors_headers["Access-Control-Allow-Origin"] = origin
+            cors_headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        # No origin header - allow all (for non-browser clients)
+        cors_headers["Access-Control-Allow-Origin"] = "*"
+    
+    # Add required CORS headers for preflight
     cors_headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
-    cors_headers["Access-Control-Allow-Headers"] = "*"
+    cors_headers["Access-Control-Allow-Headers"] = requested_headers if requested_headers else "*"
+    cors_headers["Access-Control-Allow-Credentials"] = "true"
     cors_headers["Access-Control-Max-Age"] = "3600"
     
+    # Return 204 No Content for OPTIONS preflight
     return Response(status_code=204, headers=cors_headers)
 
 @app.get("/")
