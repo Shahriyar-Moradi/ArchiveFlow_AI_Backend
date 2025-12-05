@@ -396,15 +396,9 @@ production_origins = [
 ]
 allowed_origins = list(set(settings.CORS_ORIGINS + production_origins))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,  # Specific origins (required when allow_credentials=True)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Response middleware to ensure CORS headers are always present
+# NOTE: In FastAPI, middleware runs in REVERSE order of addition
+# So we add this FIRST so it runs LAST (after CORSMiddleware)
 class CORSResponseMiddleware(BaseHTTPMiddleware):
     """Middleware to ensure CORS headers are added to all responses, including errors"""
     async def dispatch(self, request: Request, call_next):
@@ -414,31 +408,43 @@ class CORSResponseMiddleware(BaseHTTPMiddleware):
         # Process the request
         response = await call_next(request)
         
-        # Add CORS headers to all responses
-        # IMPORTANT: When allow_credentials=True, we cannot use "*" for Access-Control-Allow-Origin
-        # We must use the specific origin
+        # Always ensure CORS headers are present
+        # Override any existing headers to ensure they're correct
         if origin:
-            # Always use the origin (even if not in allowed_origins for error responses)
-            # This ensures CORS errors don't mask the actual error
+            # Always set the origin header (CORSMiddleware should have validated it)
+            # But we ensure it's set even if CORSMiddleware didn't (for error cases)
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Credentials"] = "true"
-        else:
+        elif "Access-Control-Allow-Origin" not in response.headers:
             # No origin header - for non-browser clients, we can use "*"
-            # But this should be rare in browser contexts
             response.headers["Access-Control-Allow-Origin"] = "*"
         
-        # Add other CORS headers
+        # Always set these headers (override if already set to ensure consistency)
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH"
         response.headers["Access-Control-Allow-Headers"] = "*"
         response.headers["Access-Control-Expose-Headers"] = "*"
         
         # Handle OPTIONS preflight requests
         if request.method == "OPTIONS":
-            response.headers["Access-Control-Max-Age"] = "3600"
+            if "Access-Control-Max-Age" not in response.headers:
+                response.headers["Access-Control-Max-Age"] = "3600"
+            # Ensure OPTIONS requests return 204 if not already set
+            if response.status_code == 200:
+                response.status_code = 204
         
         return response
 
+# Add CORSResponseMiddleware FIRST (runs LAST - after CORSMiddleware)
 app.add_middleware(CORSResponseMiddleware)
+
+# Add CORSMiddleware SECOND (runs FIRST - before CORSResponseMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,  # Specific origins (required when allow_credentials=True)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -2995,7 +3001,17 @@ async def gcs_upload_files(
     successful_uploads = len(uploaded)
     failed_uploads = len(failed)
 
+    # Update job to reflect failed uploads (if any)
+    if job_id and firestore_service and failed_uploads > 0:
+        try:
+            # Update job to track failed uploads
+            firestore_service.update_job_progress(job_id, failed=failed_uploads)
+            logger.info(f"Updated job {job_id} with {failed_uploads} failed uploads")
+        except Exception as e:
+            logger.warning(f"Failed to update job with failed uploads: {e}")
+
     # Update flow document count after successful uploads
+    # Note: Failed uploads are still counted in total_files, but only successful uploads create document records
     if successful_uploads > 0 and firestore_service:
         try:
             # Get current flow to check document count
@@ -3005,7 +3021,7 @@ async def gcs_upload_files(
                 # For now, we'll update it to reflect the number of documents we just created
                 current_count = flow.get('document_count', 0)
                 # Note: The actual count will be updated by increment_flow_document_count as documents complete processing
-                logger.info(f"Flow {final_flow_id} has {current_count} documents, {successful_uploads} new documents uploaded")
+                logger.info(f"Flow {final_flow_id} has {current_count} documents, {successful_uploads} new documents uploaded, {failed_uploads} failed uploads")
             else:
                 logger.warning(f"Flow {final_flow_id} not found when trying to update document count")
         except Exception as e:
@@ -3458,30 +3474,39 @@ async def get_aws_batch_status(batch_id: str):
         failed_docs = [d for d in firestore_docs if d.get('processing_status') == 'failed']
         need_review_docs = [d for d in firestore_docs if d.get('processing_status') == 'need_review']
         pending_docs = [d for d in firestore_docs if d.get('processing_status') == 'pending']
+        uploaded_docs = [d for d in firestore_docs if d.get('processing_status') == 'uploaded']
         
         logger.info(f"📊 Document status breakdown: completed={len(completed_docs)}, "
                   f"failed={len(failed_docs)}, need_review={len(need_review_docs)}, "
-                  f"processing={len(stuck_processing)}, pending={len(pending_docs)}")
+                  f"processing={len(stuck_processing)}, pending={len(pending_docs)}, "
+                  f"uploaded={len(uploaded_docs)}")
         
         # Calculate totals from multiple sources
+        # Include failed files from GCS in the total count
         total_from_gcs = temp_count + organized_count + failed_count_gcs
         total_from_firestore = len(firestore_docs)
         total_from_job = job.get('total_documents', 0) if job else 0
+        # Use the maximum to ensure we don't miss any documents
         total_docs = max(total_from_gcs, total_from_firestore, total_from_job)
         
-        logger.info(f"📊 Total documents: GCS={total_from_gcs}, Firestore={total_from_firestore}, "
-                  f"Job={total_from_job}, Final={total_docs}")
+        logger.info(f"📊 Total documents: GCS={total_from_gcs} (temp={temp_count}, organized={organized_count}, failed={failed_count_gcs}), "
+                  f"Firestore={total_from_firestore}, Job={total_from_job}, Final={total_docs}")
         
         # Determine if batch is complete
         # Batch is complete when:
-        # 1. No temp files in GCS
+        # 1. No temp files in GCS (all files have been processed or moved)
         # 2. No documents stuck in "processing" status
         # 3. All documents have final status (completed, failed, need_review, or pending)
+        # Note: "uploaded" status means file is in temp folder waiting to be processed, so it's not a final status
+        final_status_count = len(completed_docs) + len(failed_docs) + len(need_review_docs) + len(pending_docs)
         is_complete = (
             temp_count == 0 and
             len(stuck_processing) == 0 and
-            (len(completed_docs) + len(failed_docs) + len(need_review_docs) + len(pending_docs) >= total_docs or total_docs == 0)
+            (final_status_count >= total_docs or total_docs == 0)
         )
+        
+        logger.info(f"📊 Completion check: temp_count={temp_count}, stuck_processing={len(stuck_processing)}, "
+                  f"final_status_count={final_status_count}, total_docs={total_docs}, is_complete={is_complete}")
         
         # Calculate processing count
         processing_count = len(stuck_processing) if stuck_processing else temp_count
@@ -3509,15 +3534,19 @@ async def get_aws_batch_status(batch_id: str):
                       f"stuck_docs={len(stuck_processing)}")
         
         # Calculate processed and failed counts (use most accurate source)
+        # Prioritize Firestore as it has the most up-to-date status
         if firestore_docs:
             processed = len(completed_docs)
-            failed = len(failed_docs)
+            failed = len(failed_docs)  # Failed documents (validation failed, processing errors, etc.)
+            need_review = len(need_review_docs)  # Documents that need manual review
         elif job:
             processed = job.get('processed_documents', 0)
             failed = job.get('failed_documents', 0)
+            need_review = 0
         else:
             processed = organized_count
             failed = failed_count_gcs
+            need_review = 0
         
         # Build response
         response_data = {
@@ -3528,6 +3557,7 @@ async def get_aws_batch_status(batch_id: str):
             "total_documents": total_docs,
             "processed": processed,
             "failed": failed,
+            "need_review": need_review if firestore_docs else 0,
             "processing": processing,
             "processing_list": processing_list,
         }

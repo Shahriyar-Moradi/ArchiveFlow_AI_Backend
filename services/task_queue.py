@@ -383,6 +383,19 @@ class TaskQueue:
                     
                     self.firestore_service.update_document(document_id, update_data)
                 
+                # Track if we need to move file to failed folder
+                processing_failed = not result.get('success') and not handled_need_review
+                
+                # Prepare error_msg and metadata for file handling if processing failed
+                # Extract from result to ensure they're always available
+                failed_error_msg = result.get('error', 'Unknown error during processing')
+                failed_metadata = {}
+                validation_status = result.get('validation_status')
+                if validation_status:
+                    failed_metadata['validation_status'] = validation_status
+                    failed_metadata['validation_confidence'] = result.get('validation_confidence')
+                    failed_metadata['validation_label'] = result.get('validation_label')
+                
                 # Update job progress if batch job
                 if job_id:
                     if result.get('success'):
@@ -390,9 +403,69 @@ class TaskQueue:
                     else:
                         self.firestore_service.update_job_progress(job_id, failed=1)
                 
-                # Delete temp file from GCS unless we need to preserve it for manual review
-                should_delete_temp = not handled_need_review
-                if should_delete_temp:
+                # Handle temp file: move to failed folder if processing failed, delete if successful, preserve if need_review
+                if processing_failed:
+                    # Move failed file to failed folder in GCS
+                    if flow_id:
+                        try:
+                            # Construct failed folder path: organized_vouchers/{flow_id}/failed/{filename}
+                            from gcs_service import ORG_PREFIX
+                            safe_filename = re.sub(r'[<>:"/\\|?*]', '_', original_filename)
+                            failed_key = f"{ORG_PREFIX}/{flow_id}/failed/{safe_filename}"
+                            
+                            # Copy temp file to failed folder
+                            source_blob = bucket.blob(gcs_temp_path)
+                            if source_blob.exists():
+                                dest_blob = bucket.blob(failed_key)
+                                
+                                # Copy blob with metadata
+                                bucket.copy_blob(source_blob, bucket, dest_blob.name)
+                                
+                                # Add error metadata
+                                dest_blob.metadata = {
+                                    'error': failed_error_msg,
+                                    'document_id': document_id,
+                                    'original_path': gcs_temp_path
+                                }
+                                if failed_metadata:
+                                    for key, value in failed_metadata.items():
+                                        dest_blob.metadata[key] = str(value)
+                                dest_blob.patch()
+                                
+                                # Delete original temp file
+                                source_blob.delete()
+                                
+                                logger.info(f"✅ Moved failed file to failed folder: {failed_key}")
+                                
+                                # Update Firestore with failed file path
+                                self.firestore_service.update_document(document_id, {
+                                    'gcs_path': f"gs://{settings.GCS_BUCKET_NAME}/{failed_key}",
+                                    'failed_path': failed_key
+                                })
+                            else:
+                                logger.warning(f"Temp file {gcs_temp_path} does not exist, cannot move to failed folder")
+                        except Exception as e:
+                            logger.error(f"Failed to move file to failed folder: {e}")
+                            import traceback
+                            logger.error(traceback.format_exc())
+                            # Fallback: try to delete temp file
+                            try:
+                                blob = bucket.blob(gcs_temp_path)
+                                blob.delete()
+                                logger.info(f"Deleted temp file from GCS (fallback): {gcs_temp_path}")
+                            except Exception as del_e:
+                                logger.warning(f"Failed to delete temp file from GCS: {del_e}")
+                    else:
+                        logger.warning(f"Cannot move failed file to failed folder: flow_id not available for document {document_id}")
+                        # Fallback: delete temp file
+                        try:
+                            blob = bucket.blob(gcs_temp_path)
+                            blob.delete()
+                            logger.info(f"Deleted temp file from GCS (no flow_id): {gcs_temp_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete temp file from GCS: {e}")
+                elif not handled_need_review:
+                    # Processing succeeded - delete temp file
                     try:
                         blob = bucket.blob(gcs_temp_path)
                         blob.delete()
@@ -400,6 +473,7 @@ class TaskQueue:
                     except Exception as e:
                         logger.warning(f"Failed to delete temp file from GCS: {e}")
                 else:
+                    # need_review - preserve temp file
                     logger.info(f"Preserving temp file for manual review: {gcs_temp_path}")
                 
             finally:
