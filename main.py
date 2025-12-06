@@ -1252,16 +1252,41 @@ async def list_agents_batch(
                 logger.info(f"📊 Returning cached agents batch (age: {now - cached_time:.1f}s)")
                 return JSONResponse(content=cached_data)
         
-        # Get all users/agents from simple_auth
+        # Get all users/agents from simple_auth (for backward compatibility)
         users = simple_auth.get_all_users()
-        agents = [
-            {k: v for k, v in user.items() if k != 'password'}
-            for user in users
-        ]
+        agents_dict = {}
+        
+        # First, add all users from simple_auth
+        for user in users:
+            agent_id = user.get('id')
+            if agent_id:
+                agents_dict[agent_id] = {k: v for k, v in user.items() if k != 'password'}
+        
+        # Then, merge with agents from agents collection (new system)
+        try:
+            agents_from_firestore, _ = firestore_service.list_agents(page=1, page_size=1000)
+            for agent in agents_from_firestore:
+                agent_id = agent.get('id')
+                if agent_id:
+                    # Merge: agents collection takes precedence for fields that exist
+                    if agent_id in agents_dict:
+                        # Update existing agent with data from agents collection
+                        agents_dict[agent_id].update({
+                            k: v for k, v in agent.items() 
+                            if k not in ['id'] or v is not None
+                        })
+                    else:
+                        # New agent from agents collection
+                        agents_dict[agent_id] = agent
+        except Exception as e:
+            logger.warning(f"Error fetching agents from Firestore: {e}")
+        
+        # Convert dict back to list
+        agents = list(agents_dict.values())
         
         # Only calculate stats if requested (for performance)
         if include_stats:
-            # Batch calculate stats for all agents - OPTIMIZED to avoid fetching all documents
+            # Batch calculate stats for all agents - OPTIMIZED using deals collection
             agent_ids = [agent['id'] for agent in agents]
             
             try:
@@ -1270,36 +1295,37 @@ async def list_agents_batch(
                 agent_client_counts = {aid: 0 for aid in agent_ids}
                 agent_properties_counts = {aid: 0 for aid in agent_ids}
                 
-                # OPTIMIZED: Query documents in batches per agent (limit to 1000 per agent for performance)
-                # This is much faster than fetching ALL documents
+                # OPTIMIZED: Use deals collection for faster stats calculation
                 for agent_id in agent_ids:
                     try:
-                        # Count documents for this agent (limit to 1000 for performance)
+                        # Get deals for this agent (much faster than scanning documents)
+                        deals = firestore_service.get_deals_by_agent(agent_id)
+                        
+                        # Count unique clients and properties from deals
+                        client_ids = set()
+                        property_ids = set()
+                        document_count = 0
+                        
+                        for deal in deals:
+                            client_id = deal.get('clientId')
+                            property_id = deal.get('propertyId')
+                            if client_id:
+                                client_ids.add(client_id)
+                            if property_id:
+                                property_ids.add(property_id)
+                        
+                        agent_client_counts[agent_id] = len(client_ids)
+                        agent_properties_counts[agent_id] = len(property_ids)
+                        
+                        # Count documents for this agent (still need to query documents for total count)
                         docs_query = firestore_service.documents_collection.where(
                             filter=FieldFilter('agentId', '==', agent_id)
                         ).limit(1000)
                         docs = list(docs_query.stream())
                         agent_doc_counts[agent_id] = len(docs)
                         
-                        # Count unique clients from these documents
-                        client_ids = set()
-                        for doc in docs:
-                            data = doc.to_dict()
-                            if data.get('clientId'):
-                                client_ids.add(data.get('clientId'))
-                        agent_client_counts[agent_id] = len(client_ids)
                     except Exception as e:
-                        logger.warning(f"Error counting docs for agent {agent_id}: {e}")
-                    
-                    # Count properties
-                    try:
-                        properties_query = firestore_service.properties_collection.where(
-                            filter=FieldFilter('agentId', '==', agent_id)
-                        )
-                        properties = list(properties_query.stream())
-                        agent_properties_counts[agent_id] = len(properties)
-                    except Exception as e:
-                        logger.warning(f"Error counting properties for agent {agent_id}: {e}")
+                        logger.warning(f"Error counting stats for agent {agent_id}: {e}")
                 
                 # Assign stats to agents
                 for agent in agents:
@@ -2715,6 +2741,25 @@ async def create_document_metadata(
             document_data['clientId'] = clientId
         if documentType:
             document_data['documentType'] = documentType
+        
+        # Auto-create/find deal if agentId, clientId, and propertyId are all provided
+        deal_id = None
+        if agent_id and clientId and propertyId:
+            try:
+                deal = firestore_service.find_or_create_deal(
+                    agent_id=agent_id,
+                    client_id=clientId,
+                    property_id=propertyId,
+                    deal_type='RENT',  # Default, can be updated later
+                    stage='LEAD'
+                )
+                if deal:
+                    deal_id = deal.get('id')
+                    document_data['dealId'] = deal_id
+                    logger.info(f"✅ Created/found deal {deal_id} for document {document_id}")
+            except Exception as e:
+                logger.warning(f"Failed to create/find deal for document {document_id}: {e}")
+                # Continue without deal - document will still be created
         
         firestore_service.create_document(document_id, document_data)
         logger.info(f"✅ Created document metadata: {document_id} with status=uploading")

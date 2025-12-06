@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from google.cloud import firestore
-from google.cloud.firestore import Query, FieldFilter
+from google.cloud.firestore import Query, FieldFilter, FieldPath
 
 import sys
 from pathlib import Path
@@ -14,6 +14,25 @@ sys.path.append(str(Path(__file__).parent.parent))
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+def _get_query_count(query: Query) -> int:
+    """Return the total number of documents for a query using aggregation.
+
+    Why: list endpoints for agents, clients, and properties need accurate totals
+    for pagination, but fetching every document to compute `len()` is slow and
+    expensive. Firestore's count aggregation runs server-side and only returns
+    the count metadata, keeping responses fast. If aggregation is unsupported
+    (older emulator/SDK), we fall back to -1 so callers can skip showing totals
+    instead of triggering costly full scans.
+    """
+    try:
+        count_query = query.count()
+        results = count_query.get()
+        if results and results[0] and hasattr(results[0][0], "value"):
+            return int(results[0][0].value)
+    except Exception as e:
+        logger.warning(f"Count aggregation failed: {e}")
+    return -1
 
 class FirestoreService:
     """Service for interacting with Firestore database"""
@@ -34,6 +53,36 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to initialize Firestore client: {e}")
             raise
+    
+    @staticmethod
+    def _fetch_documents_by_ids(collection, ids: set[str]) -> List[Dict[str, Any]]:
+        """Fetch documents by IDs in efficient chunks using document_id IN queries.
+
+        Rationale:
+        - Calling `.document(id).get()` per record makes agent/client/property list
+          endpoints slow because each fetch is a separate network round trip.
+        - Firestore limits `IN` filters to 10 elements, so we batch IDs into chunks
+          to stay within limits while keeping requests to the absolute minimum.
+
+        Use this helper whenever you need to hydrate related entities (e.g.,
+        properties from a batch of deals) instead of looping over individual gets.
+        """
+        documents: List[Dict[str, Any]] = []
+        if not ids:
+            return documents
+        
+        id_list = list(ids)
+        chunk_size = 10
+        
+        for i in range(0, len(id_list), chunk_size):
+            chunk_ids = id_list[i : i + chunk_size]
+            query = collection.where(FieldPath.document_id(), "in", chunk_ids)
+            for doc in query.stream():
+                data = doc.to_dict()
+                data["id"] = doc.id
+                documents.append(data)
+        
+        return documents
     
     # Document Operations
     
@@ -786,7 +835,9 @@ class FirestoreService:
     ) -> tuple[List[Dict[str, Any]], int]:
         """List clients with pagination"""
         try:
-            query = self.clients_collection.order_by('created_at', direction=Query.DESCENDING)
+            base_query = self.clients_collection.order_by('created_at', direction=Query.DESCENDING)
+            total = _get_query_count(base_query)
+            query = base_query
             
             if cursor_doc_id:
                 cursor_doc = self.clients_collection.document(cursor_doc_id).get()
@@ -803,7 +854,6 @@ class FirestoreService:
                 data['id'] = doc.id
                 clients.append(data)
             
-            total = -1
             return clients, total
         except Exception as e:
             logger.error(f"Failed to list clients: {e}")
@@ -907,11 +957,14 @@ class FirestoreService:
         """List properties with pagination and optional agent filter"""
         try:
             if agent_id:
-                query = self.properties_collection.where(
+                base_query = self.properties_collection.where(
                     filter=FieldFilter('agentId', '==', agent_id)
                 ).order_by('created_at', direction=Query.DESCENDING)
             else:
-                query = self.properties_collection.order_by('created_at', direction=Query.DESCENDING)
+                base_query = self.properties_collection.order_by('created_at', direction=Query.DESCENDING)
+            
+            total = _get_query_count(base_query)
+            query = base_query
             
             if cursor_doc_id:
                 cursor_doc = self.properties_collection.document(cursor_doc_id).get()
@@ -928,7 +981,6 @@ class FirestoreService:
                 data['id'] = doc.id
                 properties.append(data)
             
-            total = -1
             return properties, total
         except Exception as e:
             logger.error(f"Failed to list properties: {e}")
@@ -1315,7 +1367,7 @@ class FirestoreService:
         page: int = 1,
         page_size: int = 20,
         cursor_doc_id: Optional[str] = None,
-        use_deals: bool = False
+        use_deals: bool = True
     ) -> tuple[List[Dict[str, Any]], int]:
         """
         List all properties managed by a specific agent.
@@ -1326,21 +1378,13 @@ class FirestoreService:
             if use_deals:
                 # Use deals collection to find properties with active deals for this agent
                 deals = self.get_deals_by_agent(agent_id)
-                property_ids = set()
-                for deal in deals:
-                    property_id = deal.get('propertyId')
-                    if property_id:
-                        property_ids.add(property_id)
+                property_ids = {deal.get('propertyId') for deal in deals if deal.get('propertyId')}
                 
                 if not property_ids:
                     return [], 0
                 
-                # Fetch properties by IDs
-                properties = []
-                for property_id in property_ids:
-                    prop = self.get_property(property_id)
-                    if prop:
-                        properties.append(prop)
+                # Fetch properties by IDs using chunked IN queries
+                properties = self._fetch_documents_by_ids(self.properties_collection, property_ids)
                 
                 # Sort by created_at descending
                 properties.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
@@ -1354,9 +1398,11 @@ class FirestoreService:
                 return paginated_properties, total
             else:
                 # Original method: query properties collection directly
-                query = self.properties_collection.where(
+                base_query = self.properties_collection.where(
                     filter=FieldFilter('agentId', '==', agent_id)
                 ).order_by('created_at', direction=Query.DESCENDING)
+                total = _get_query_count(base_query)
+                query = base_query
                 
                 if cursor_doc_id:
                     cursor_doc = self.properties_collection.document(cursor_doc_id).get()
@@ -1373,7 +1419,6 @@ class FirestoreService:
                     data['id'] = doc.id
                     properties.append(data)
                 
-                total = -1
                 return properties, total
         except Exception as e:
             logger.error(f"Failed to list properties by agent: {e}")
@@ -1392,21 +1437,13 @@ class FirestoreService:
             deals = self.get_deals_by_agent(agent_id)
             
             # Extract unique client IDs from deals
-            client_ids = set()
-            for deal in deals:
-                client_id = deal.get('clientId')
-                if client_id:
-                    client_ids.add(client_id)
+            client_ids = {deal.get('clientId') for deal in deals if deal.get('clientId')}
             
             if not client_ids:
                 return [], 0
             
-            # Get clients by IDs
-            clients = []
-            for client_id in client_ids:
-                client = self.get_client(client_id)
-                if client:
-                    clients.append(client)
+            # Get clients by IDs using chunked IN queries
+            clients = self._fetch_documents_by_ids(self.clients_collection, client_ids)
             
             # Sort by created_at descending
             clients.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
@@ -1423,27 +1460,59 @@ class FirestoreService:
             return [], 0
     
     def get_client_agent(self, client_id: str) -> Optional[Dict[str, Any]]:
-        """Get the agent who uploaded the most documents for a client"""
+        """Get the agent who has the most deals with a client (optimized using deals collection)"""
         try:
-            # Get all documents for this client
-            client_docs_query = self.documents_collection.where(
-                filter=FieldFilter('clientId', '==', client_id)
-            )
-            client_docs = list(client_docs_query.stream())
+            # Use deals collection for efficient querying
+            deals = self.get_deals_by_client(client_id)
             
-            if not client_docs:
-                return None
+            if not deals:
+                # Fallback to documents if no deals found
+                client_docs_query = self.documents_collection.where(
+                    filter=FieldFilter('clientId', '==', client_id)
+                )
+                client_docs = list(client_docs_query.stream())
+                
+                if not client_docs:
+                    return None
+                
+                # Count documents by agentId
+                agent_counts = {}
+                agent_timestamps = {}
+                for doc in client_docs:
+                    data = doc.to_dict()
+                    agent_id = data.get('agentId')
+                    if agent_id:
+                        agent_counts[agent_id] = agent_counts.get(agent_id, 0) + 1
+                        created_at = data.get('created_at')
+                        if created_at:
+                            if agent_id not in agent_timestamps or created_at > agent_timestamps[agent_id]:
+                                agent_timestamps[agent_id] = created_at
+                
+                if not agent_counts:
+                    return None
+                
+                max_count = max(agent_counts.values())
+                top_agents = [agent_id for agent_id, count in agent_counts.items() if count == max_count]
+                
+                if len(top_agents) > 1:
+                    top_agent = max(top_agents, key=lambda agent_id: agent_timestamps.get(agent_id, datetime.min))
+                else:
+                    top_agent = top_agents[0]
+                
+                return {
+                    "id": top_agent,
+                    "document_count": max_count
+                }
             
-            # Count documents by agentId
+            # Count deals by agentId
             agent_counts = {}
             agent_timestamps = {}
-            for doc in client_docs:
-                data = doc.to_dict()
-                agent_id = data.get('agentId')
+            for deal in deals:
+                agent_id = deal.get('agentId')
                 if agent_id:
                     agent_counts[agent_id] = agent_counts.get(agent_id, 0) + 1
-                    # Track most recent document timestamp for tie-breaking
-                    created_at = data.get('created_at')
+                    # Track most recent deal timestamp for tie-breaking
+                    created_at = deal.get('createdAt')
                     if created_at:
                         if agent_id not in agent_timestamps or created_at > agent_timestamps[agent_id]:
                             agent_timestamps[agent_id] = created_at
@@ -1455,7 +1524,7 @@ class FirestoreService:
             max_count = max(agent_counts.values())
             top_agents = [agent_id for agent_id, count in agent_counts.items() if count == max_count]
             
-            # If multiple agents have same count, use most recent document
+            # If multiple agents have same count, use most recent deal
             if len(top_agents) > 1:
                 top_agent = max(top_agents, key=lambda agent_id: agent_timestamps.get(agent_id, datetime.min))
             else:
@@ -1463,7 +1532,7 @@ class FirestoreService:
             
             return {
                 "id": top_agent,
-                "document_count": max_count
+                "deal_count": max_count
             }
         except Exception as e:
             logger.error(f"Failed to get client agent: {e}")
@@ -1765,7 +1834,9 @@ class FirestoreService:
     ) -> tuple[List[Dict[str, Any]], int]:
         """List agents with pagination"""
         try:
-            query = self.agents_collection.order_by('created_at', direction=Query.DESCENDING)
+            base_query = self.agents_collection.order_by('created_at', direction=Query.DESCENDING)
+            total = _get_query_count(base_query)
+            query = base_query
             
             if cursor_doc_id:
                 cursor_doc = self.agents_collection.document(cursor_doc_id).get()
@@ -1782,7 +1853,6 @@ class FirestoreService:
                 data['id'] = doc.id
                 agents.append(data)
             
-            total = -1
             return agents, total
         except Exception as e:
             logger.error(f"Failed to list agents: {e}")
