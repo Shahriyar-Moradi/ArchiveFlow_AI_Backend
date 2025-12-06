@@ -124,6 +124,17 @@ class TaskQueue:
                 blob.download_to_filename(temp_file_path)
                 logger.info(f"Downloaded file from GCS: {gcs_temp_path}")
                 
+                # Calculate image hash for duplicate detection (if not already stored)
+                import hashlib
+                with open(temp_file_path, 'rb') as f:
+                    file_content = f.read()
+                    image_hash = hashlib.sha256(file_content).hexdigest()
+                
+                # Update document with image_hash if not already set
+                doc = self.firestore_service.get_document(document_id)
+                if doc and not doc.get('image_hash'):
+                    self.firestore_service.update_document(document_id, {'image_hash': image_hash})
+                
                 # Process document
                 result = self.document_processor.process_document(
                     temp_file_path,
@@ -553,6 +564,13 @@ class TaskQueue:
             client_id = clients[0]['id']
             if is_id_document:
                 logger.info(f"✅ ID document {document_id} - Found existing client {client_id} for {client_full_name}")
+            
+            # Ensure existing client has agent_id assigned if document has one
+            if agent_id:
+                existing_client = self.firestore_service.get_client(client_id)
+                if existing_client and not existing_client.get('agent_id'):
+                    self.firestore_service.update_client(client_id, {'agent_id': agent_id})
+                    logger.info(f"Assigned agent {agent_id} to existing client {client_id} from document")
         else:
             # Create new client
             client_id = str(uuid.uuid4())
@@ -561,8 +579,12 @@ class TaskQueue:
                 'full_name': client_full_name,
                 'created_from': 'document_extraction'
             }
+            # Assign agent_id if available from document
+            if agent_id:
+                client_data['agent_id'] = agent_id
+            
             self.firestore_service.create_client(client_id, client_data)
-            logger.info(f"Created new client {client_id} for {client_full_name}")
+            logger.info(f"Created new client {client_id} for {client_full_name}" + (f" with agent {agent_id}" if agent_id else ""))
             if is_id_document:
                 logger.info(f"✅ ID document {document_id} - Created new client {client_id} for {client_full_name}")
         

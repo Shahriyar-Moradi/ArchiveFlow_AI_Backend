@@ -4,8 +4,13 @@ Firestore service for storing document metadata and job status
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+
+
+
 from google.cloud import firestore
-from google.cloud.firestore import Query, FieldFilter, FieldPath
+from google.cloud.firestore import FieldFilter, Query
+from google.cloud.firestore_v1.field_path import FieldPath
+from google.api_core import exceptions as gcp_exceptions
 
 import sys
 from pathlib import Path
@@ -109,8 +114,31 @@ class FirestoreService:
                 data['document_id'] = doc.id
                 return data
             return None
+        except gcp_exceptions.PermissionDenied as e:
+            logger.error(f"Permission denied getting document {document_id}: {e}")
+            return None
+        except gcp_exceptions.DeadlineExceeded as e:
+            logger.error(f"Timeout getting document {document_id}: {e}")
+            return None
+        except gcp_exceptions.ServiceUnavailable as e:
+            logger.error(f"Firestore service unavailable getting document {document_id}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to get document: {e}")
+            logger.error(f"Failed to get document {document_id}: {e}", exc_info=True)
+            return None
+    
+    def get_document_by_image_hash(self, image_hash: str) -> Optional[Dict[str, Any]]:
+        """Get a document by image hash (for duplicate detection)"""
+        try:
+            query = self.documents_collection.where('image_hash', '==', image_hash).limit(1)
+            docs = query.stream()
+            for doc in docs:
+                data = doc.to_dict()
+                data['document_id'] = doc.id
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get document by image hash: {e}")
             return None
     
     def update_document(self, document_id: str, data: Dict[str, Any]) -> bool:
@@ -155,6 +183,19 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to get compliance check results: {e}")
             return None
+    
+    def get_document_count(self) -> int:
+        """Get total count of documents in Firestore"""
+        try:
+            count_query = self.documents_collection.count()
+            results = count_query.get()
+            if results and results[0] and hasattr(results[0][0], "value"):
+                return int(results[0][0].value)
+            # Fallback: count by streaming
+            return sum(1 for _ in self.documents_collection.stream())
+        except Exception as e:
+            logger.error(f"Failed to get document count: {e}")
+            return 0
     
     def list_documents(
         self,
@@ -806,6 +847,9 @@ class FirestoreService:
             data['updated_at'] = firestore.SERVER_TIMESTAMP
             data.setdefault('property_file_count', 0)
             data.setdefault('created_from', 'manual')
+            # Precompute lowercase name for indexed search
+            if 'full_name' in data:
+                data['full_name_lc'] = data.get('full_name', '').lower().strip()
             doc_ref.set(data)
             logger.info(f"Created client record: {client_id}")
             return client_id
@@ -864,6 +908,9 @@ class FirestoreService:
         try:
             doc_ref = self.clients_collection.document(client_id)
             data['updated_at'] = firestore.SERVER_TIMESTAMP
+            # Update lowercase name field if full_name is being updated
+            if 'full_name' in data:
+                data['full_name_lc'] = data.get('full_name', '').lower().strip()
             doc_ref.update(data)
             logger.info(f"Updated client record: {client_id}")
             return True
@@ -883,23 +930,32 @@ class FirestoreService:
             return False
     
     def search_clients_by_name(self, name: str) -> List[Dict[str, Any]]:
-        """Search clients by name (fuzzy matching)"""
+        """Search clients by name using indexed prefix matching.
+        
+        Uses precomputed full_name_lc field with range queries for efficient
+        prefix matching. Avoids full collection scans by leveraging Firestore
+        indexes on the lowercase field.
+        """
         try:
             # Normalize search term
             search_term = name.lower().strip()
             
-            # Get all clients and filter in memory (Firestore doesn't support case-insensitive search)
-            docs = list(self.clients_collection.stream())
-            matches = []
+            if not search_term:
+                return []
             
-            for doc in docs:
+            # Use range query for prefix matching (e.g., "john" matches "John Doe", "Johnny")
+            # \uf8ff is a high Unicode character that ensures we get all strings starting with search_term
+            query = self.clients_collection.where(
+                filter=FieldFilter('full_name_lc', '>=', search_term)
+            ).where(
+                filter=FieldFilter('full_name_lc', '<', search_term + '\uf8ff')
+            ).limit(50)  # Limit results to prevent excessive data transfer
+            
+            matches = []
+            for doc in query.stream():
                 data = doc.to_dict()
-                full_name = data.get('full_name', '').lower().strip()
-                
-                # Simple fuzzy matching: check if search term is in name or vice versa
-                if search_term in full_name or full_name in search_term:
-                    data['id'] = doc.id
-                    matches.append(data)
+                data['id'] = doc.id
+                matches.append(data)
             
             return matches
         except Exception as e:
@@ -914,6 +970,9 @@ class FirestoreService:
             doc_ref = self.properties_collection.document(property_id)
             data['created_at'] = firestore.SERVER_TIMESTAMP
             data['updated_at'] = firestore.SERVER_TIMESTAMP
+            # Precompute lowercase reference for indexed search
+            if 'reference' in data:
+                data['reference_lc'] = data.get('reference', '').lower().strip()
             doc_ref.set(data)
             logger.info(f"Created property record: {property_id}")
             return property_id
@@ -940,6 +999,9 @@ class FirestoreService:
         try:
             doc_ref = self.properties_collection.document(property_id)
             data['updated_at'] = firestore.SERVER_TIMESTAMP
+            # Update lowercase reference field if reference is being updated
+            if 'reference' in data:
+                data['reference_lc'] = data.get('reference', '').lower().strip()
             doc_ref.update(data)
             logger.info(f"Updated property record: {property_id}")
             return True
@@ -987,22 +1049,32 @@ class FirestoreService:
             return [], 0
     
     def search_properties_by_reference(self, reference: str) -> List[Dict[str, Any]]:
-        """Search properties by reference"""
+        """Search properties by reference using indexed prefix matching.
+        
+        Uses precomputed reference_lc field with range queries for efficient
+        prefix matching. Avoids full collection scans by leveraging Firestore
+        indexes on the lowercase field.
+        """
         try:
             # Normalize search term
             search_term = reference.lower().strip()
             
-            # Get all properties and filter in memory
-            docs = list(self.properties_collection.stream())
-            matches = []
+            if not search_term:
+                return []
             
-            for doc in docs:
+            # Use range query for prefix matching (e.g., "MVTA" matches "MVTA-2305-DXB")
+            # \uf8ff is a high Unicode character that ensures we get all strings starting with search_term
+            query = self.properties_collection.where(
+                filter=FieldFilter('reference_lc', '>=', search_term)
+            ).where(
+                filter=FieldFilter('reference_lc', '<', search_term + '\uf8ff')
+            ).limit(50)  # Limit results to prevent excessive data transfer
+            
+            matches = []
+            for doc in query.stream():
                 data = doc.to_dict()
-                prop_reference = data.get('reference', '').lower().strip()
-                
-                if search_term in prop_reference or prop_reference in search_term:
-                    data['id'] = doc.id
-                    matches.append(data)
+                data['id'] = doc.id
+                matches.append(data)
             
             return matches
         except Exception as e:
@@ -1124,6 +1196,53 @@ class FirestoreService:
             return True
         except Exception as e:
             logger.error(f"Failed to update property file record: {e}")
+            return False
+    
+    def update_property_file_client_id(self, property_file_id: str, client_id: str) -> bool:
+        """
+        Safely update a property file's client_id and update related deal if it exists.
+        This ensures data consistency when property files are found by client_full_name
+        but have incorrect or missing client_id.
+        """
+        try:
+            # Get the property file first
+            property_file = self.get_property_file(property_file_id)
+            if not property_file:
+                logger.warning(f"Property file {property_file_id} not found, cannot update client_id")
+                return False
+            
+            current_client_id = property_file.get('client_id')
+            
+            # If client_id is already correct, no update needed
+            if current_client_id == client_id:
+                logger.debug(f"Property file {property_file_id} already has correct client_id {client_id}")
+                return True
+            
+            # Update the property file with correct client_id
+            update_data = {'client_id': client_id}
+            success = self.update_property_file(property_file_id, update_data)
+            
+            if not success:
+                return False
+            
+            logger.info(f"Updated property file {property_file_id} client_id from {current_client_id} to {client_id}")
+            
+            # Update related deal if it exists
+            deal_id = property_file.get('dealId')
+            if deal_id:
+                deal = self.get_deal(deal_id)
+                if deal:
+                    deal_client_id = deal.get('clientId')
+                    if deal_client_id != client_id:
+                        # Update the deal's clientId to match
+                        self.update_deal(deal_id, {'clientId': client_id})
+                        logger.info(f"Updated deal {deal_id} clientId from {deal_client_id} to {client_id}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update property file client_id: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     def delete_property_file(self, property_file_id: str) -> bool:
@@ -1460,9 +1579,23 @@ class FirestoreService:
             return [], 0
     
     def get_client_agent(self, client_id: str) -> Optional[Dict[str, Any]]:
-        """Get the agent who has the most deals with a client (optimized using deals collection)"""
+        """Get the agent assigned to a client.
+        
+        First checks if agent_id is stored directly on the client document.
+        If not, falls back to finding agent with most deals/documents.
+        """
         try:
-            # Use deals collection for efficient querying
+            # First, check if agent_id is stored directly on client document
+            client = self.get_client(client_id)
+            if client and client.get('agent_id'):
+                agent_id = client.get('agent_id')
+                logger.info(f"Client {client_id} has stored agent_id: {agent_id}")
+                return {
+                    "id": agent_id,
+                    "from_stored_field": True
+                }
+            
+            # Fallback: Use deals collection for efficient querying
             deals = self.get_deals_by_client(client_id)
             
             if not deals:
@@ -1571,6 +1704,19 @@ class FirestoreService:
                                 data = doc.to_dict()
                                 data['id'] = doc.id
                                 property_files.append(data)
+                            
+                            # Fix data consistency: update property files with correct client_id
+                            for pf in property_files:
+                                pf_client_id = pf.get('client_id')
+                                if pf_client_id != client_id:
+                                    # Update property file to have correct client_id
+                                    pf_id = pf.get('id')
+                                    if pf_id:
+                                        self.update_property_file_client_id(pf_id, client_id)
+                                        # Update the in-memory data for immediate use
+                                        pf['client_id'] = client_id
+                                        logger.info(f"Fixed property file {pf_id}: updated client_id from {pf_client_id} to {client_id}")
+                            
                             logger.info(f"Found {len(property_files)} property files by client_full_name '{client.get('full_name')}' for client {client_id}")
                         except Exception as e:
                             logger.warning(f"Failed to search property files by client_full_name: {e}")
@@ -1689,42 +1835,104 @@ class FirestoreService:
             
             client_ids = [c['id'] for c in clients]
             
-            # Batch fetch all property files for these clients (avoid N queries)
-            # Fetch all property files and filter in memory to avoid index requirements
+            # Batch fetch property files for these clients using chunked IN queries
+            # This avoids streaming the entire collection and only fetches relevant files
+            property_files_by_client = {}
             try:
-                all_property_files = list(self.property_files_collection.stream())
-                # Group property files by client_id
-                property_files_by_client = {}
-                for pf_doc in all_property_files:
-                    pf_data = pf_doc.to_dict()
-                    pf_client_id = pf_data.get('client_id')
-                    if pf_client_id and pf_client_id in client_ids:
-                        if pf_client_id not in property_files_by_client:
-                            property_files_by_client[pf_client_id] = []
-                        pf_data['id'] = pf_doc.id
-                        property_files_by_client[pf_client_id].append(pf_data)
+                if client_ids:
+                    # Chunk client_ids into batches of 10 (Firestore IN limit)
+                    chunk_size = 10
+                    all_property_files = []
+                    
+                    for i in range(0, len(client_ids), chunk_size):
+                        chunk_client_ids = client_ids[i : i + chunk_size]
+                        query = self.property_files_collection.where(
+                            filter=FieldFilter('client_id', 'in', chunk_client_ids)
+                        )
+                        for pf_doc in query.stream():
+                            pf_data = pf_doc.to_dict()
+                            pf_data['id'] = pf_doc.id
+                            all_property_files.append(pf_data)
+                    
+                    # Group property files by client_id
+                    for pf_data in all_property_files:
+                        pf_client_id = pf_data.get('client_id')
+                        if pf_client_id and pf_client_id in client_ids:
+                            if pf_client_id not in property_files_by_client:
+                                property_files_by_client[pf_client_id] = []
+                            property_files_by_client[pf_client_id].append(pf_data)
+                    
+                    # Fix data consistency: Check for clients with no property files found
+                    # and try to find property files by client_full_name as fallback
+                    clients_without_property_files = [cid for cid in client_ids if cid not in property_files_by_client]
+                    if clients_without_property_files:
+                        # For clients without property files, check if there are property files
+                        # with matching client_full_name but wrong client_id
+                        for client_id in clients_without_property_files:
+                            client = next((c for c in clients if c['id'] == client_id), None)
+                            if client and client.get('full_name'):
+                                try:
+                                    # Search property files by client_full_name
+                                    query = self.property_files_collection.where(
+                                        filter=FieldFilter('client_full_name', '==', client.get('full_name'))
+                                    ).limit(10)  # Limit to avoid too many results
+                                    docs = list(query.stream())
+                                    
+                                    for doc in docs:
+                                        pf_data = doc.to_dict()
+                                        pf_data['id'] = doc.id
+                                        pf_client_id = pf_data.get('client_id')
+                                        
+                                        # If this property file has wrong or missing client_id, fix it
+                                        if pf_client_id != client_id:
+                                            pf_id = pf_data.get('id')
+                                            if pf_id:
+                                                self.update_property_file_client_id(pf_id, client_id)
+                                                logger.info(f"Fixed property file {pf_id} in batch: updated client_id from {pf_client_id} to {client_id}")
+                                                # Update the in-memory data
+                                                pf_data['client_id'] = client_id
+                                        
+                                        # Add to property_files_by_client for this client
+                                        if client_id not in property_files_by_client:
+                                            property_files_by_client[client_id] = []
+                                        property_files_by_client[client_id].append(pf_data)
+                                except Exception as e:
+                                    logger.warning(f"Error checking property files by name for client {client_id}: {e}")
             except Exception as e:
                 logger.warning(f"Error fetching property files in batch: {e}")
                 property_files_by_client = {}
             
-            # Extract unique properties from property files for each client
-            client_properties_map = {}
+            # Extract unique property IDs from all property files and batch fetch
+            all_property_ids = set()
+            property_id_to_client_map = {}  # Track which properties belong to which clients
+            
             for client_id in client_ids:
-                properties = []
-                property_ids_seen = set()
-                
                 if client_id in property_files_by_client:
                     for pf in property_files_by_client[client_id]:
                         property_id = pf.get('property_id')
-                        if property_id and property_id not in property_ids_seen:
-                            # Fetch property details
-                            property_data = self.get_property(property_id)
-                            if property_data:
-                                properties.append(property_data)
-                                property_ids_seen.add(property_id)
-                
-                if properties:
-                    client_properties_map[client_id] = properties
+                        if property_id:
+                            all_property_ids.add(property_id)
+                            if property_id not in property_id_to_client_map:
+                                property_id_to_client_map[property_id] = []
+                            if client_id not in property_id_to_client_map[property_id]:
+                                property_id_to_client_map[property_id].append(client_id)
+            
+            # Batch fetch all properties at once
+            properties_map = {}
+            if all_property_ids:
+                properties_list = self._fetch_documents_by_ids(self.properties_collection, all_property_ids)
+                for prop in properties_list:
+                    properties_map[prop['id']] = prop
+            
+            # Group properties by client_id
+            client_properties_map = {}
+            for property_id, client_ids_for_prop in property_id_to_client_map.items():
+                if property_id in properties_map:
+                    prop_data = properties_map[property_id]
+                    for client_id in client_ids_for_prop:
+                        if client_id not in client_properties_map:
+                            client_properties_map[client_id] = []
+                        client_properties_map[client_id].append(prop_data)
             
             # Get all documents to batch-process agent relationships
             all_docs = []
@@ -1753,11 +1961,17 @@ class FirestoreService:
             # Attach relations to clients
             for client in clients:
                 client_id = client['id']
-                # Attach agent info (just the ID, frontend will fetch full details if needed)
-                if client_id in client_agent_map:
+                
+                # First check if client has stored agent_id
+                stored_agent_id = client.get('agent_id')
+                if stored_agent_id:
+                    client['agent'] = {'id': stored_agent_id}
+                elif client_id in client_agent_map:
+                    # Fallback to agent from documents/deals
                     client['agent'] = {'id': client_agent_map[client_id]['id']}
                 else:
                     client['agent'] = None
+                
                 # Attach properties
                 client['properties'] = client_properties_map.get(client_id, [])
             
@@ -1880,6 +2094,201 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to delete agent record: {e}")
             return False
+    
+    def find_agent_by_name(self, full_name: str) -> Optional[Dict[str, Any]]:
+        """Find an agent by matching full name.
+        
+        Searches both:
+        1. Agents collection in Firestore (by fullName field)
+        2. Auth service users (by full_name field)
+        
+        Returns the first matching agent found.
+        """
+        try:
+            if not full_name or not full_name.strip():
+                return None
+            
+            normalized_name = full_name.strip()
+            
+            # First, check agents collection in Firestore
+            try:
+                agents_query = self.agents_collection.where(
+                    filter=FieldFilter('fullName', '==', normalized_name)
+                ).limit(1)
+                
+                agents = list(agents_query.stream())
+                if agents:
+                    agent_doc = agents[0]
+                    agent_data = agent_doc.to_dict()
+                    agent_data['id'] = agent_doc.id
+                    logger.info(f"Found agent by name in agents collection: {normalized_name} -> {agent_doc.id}")
+                    return agent_data
+            except Exception as e:
+                logger.warning(f"Error searching agents collection for name {normalized_name}: {e}")
+            
+            # Then, check auth service users
+            try:
+                from simple_auth import simple_auth
+                users = simple_auth.get_all_users()
+                
+                for user in users:
+                    user_full_name = user.get('full_name', '').strip()
+                    if user_full_name and user_full_name.lower() == normalized_name.lower():
+                        logger.info(f"Found agent by name in auth service: {normalized_name} -> {user.get('id')}")
+                        return {
+                            'id': user.get('id'),
+                            'full_name': user_full_name,
+                            'email': user.get('email'),
+                            'role': user.get('role', 'agent')
+                        }
+            except Exception as e:
+                logger.warning(f"Error searching auth service for name {normalized_name}: {e}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Failed to find agent by name {full_name}: {e}")
+            return None
+    
+    def find_agent_by_user_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Find an agent by user ID.
+        
+        Searches both:
+        1. Agents collection in Firestore (by ID)
+        2. Auth service users (by ID)
+        
+        Returns the agent/user info if found.
+        """
+        try:
+            if not user_id:
+                return None
+            
+            # First, check agents collection in Firestore
+            try:
+                agent = self.get_agent(user_id)
+                if agent:
+                    logger.info(f"Found agent by ID in agents collection: {user_id}")
+                    return agent
+            except Exception as e:
+                logger.warning(f"Error getting agent from agents collection for ID {user_id}: {e}")
+            
+            # Then, check auth service users
+            try:
+                from simple_auth import simple_auth
+                users = simple_auth.get_all_users()
+                
+                for user in users:
+                    if user.get('id') == user_id:
+                        logger.info(f"Found agent by ID in auth service: {user_id}")
+                        return {
+                            'id': user.get('id'),
+                            'full_name': user.get('full_name'),
+                            'email': user.get('email'),
+                            'role': user.get('role', 'agent')
+                        }
+            except Exception as e:
+                logger.warning(f"Error searching auth service for ID {user_id}: {e}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Failed to find agent by user ID {user_id}: {e}")
+            return None
+    
+    def auto_assign_agent_to_client(self, client_id: str, current_user: Dict[str, Any]) -> Optional[str]:
+        """Automatically assign an agent to a client based on the logged-in user.
+        
+        Args:
+            client_id: The client ID to assign agent to
+            current_user: Dictionary containing user info (id, full_name, role, email)
+        
+        Returns:
+            The agent_id that was assigned, or None if assignment failed
+        """
+        try:
+            # Check if client already has an agent assigned
+            client = self.get_client(client_id)
+            if not client:
+                logger.warning(f"Client {client_id} not found, cannot assign agent")
+                return None
+            
+            # Check if client already has agent_id stored
+            if client.get('agent_id'):
+                logger.info(f"Client {client_id} already has agent_id: {client.get('agent_id')}")
+                return client.get('agent_id')
+            
+            # Determine agent_id based on current_user
+            agent_id = None
+            user_full_name = current_user.get('full_name', '').strip()
+            user_id = current_user.get('id')
+            user_role = current_user.get('role', 'agent')
+            
+            # For admin users, use admin's user_id as agent_id
+            is_admin = user_role == 'admin' or user_id == 'demo_admin_user' or current_user.get('email') == 'admin@example.com'
+            
+            if is_admin:
+                # Admin: use admin's user_id directly
+                agent_id = user_id
+                logger.info(f"Admin user detected, using user_id as agent_id: {agent_id}")
+            elif user_full_name:
+                # Try to find agent by matching user's full_name with agent's name
+                agent = self.find_agent_by_name(user_full_name)
+                if agent:
+                    agent_id = agent.get('id')
+                    logger.info(f"Found agent by name matching: {user_full_name} -> {agent_id}")
+                else:
+                    # If no match found, use user_id directly
+                    agent_id = user_id
+                    logger.info(f"No agent match found by name, using user_id as agent_id: {agent_id}")
+            else:
+                # Fallback: use user_id directly
+                agent_id = user_id
+                logger.info(f"Using user_id as agent_id (no full_name available): {agent_id}")
+            
+            if not agent_id:
+                logger.warning(f"Could not determine agent_id for client {client_id}")
+                return None
+            
+            # Update client document with agent_id
+            update_success = self.update_client(client_id, {'agent_id': agent_id})
+            if not update_success:
+                logger.error(f"Failed to update client {client_id} with agent_id {agent_id}")
+                return None
+            
+            logger.info(f"Successfully assigned agent {agent_id} to client {client_id}")
+            
+            # Get client properties to create deals if properties exist
+            properties = self.get_client_properties(client_id)
+            
+            # Create deals for each property if they don't exist
+            for property_data in properties:
+                property_id = property_data.get('id')
+                if property_id:
+                    # Check if deal already exists
+                    existing_deals = self.get_deals_by_client(client_id)
+                    deal_exists = any(
+                        deal.get('agentId') == agent_id and 
+                        deal.get('propertyId') == property_id and 
+                        deal.get('status') == 'ACTIVE'
+                        for deal in existing_deals
+                    )
+                    
+                    if not deal_exists:
+                        # Create deal linking agent, client, and property
+                        deal = self.find_or_create_deal(
+                            agent_id=agent_id,
+                            client_id=client_id,
+                            property_id=property_id,
+                            deal_type='RENT',  # Default, can be updated later
+                            stage='LEAD'
+                        )
+                        if deal:
+                            logger.info(f"Created deal {deal.get('id')} for agent {agent_id}, client {client_id}, property {property_id}")
+            
+            return agent_id
+        except Exception as e:
+            logger.error(f"Failed to auto-assign agent to client {client_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
     
     # Deal Operations
     

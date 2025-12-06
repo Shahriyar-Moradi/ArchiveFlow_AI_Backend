@@ -15,6 +15,7 @@ import time
 
 from google.cloud import storage
 from google.oauth2 import service_account
+from google.api_core import exceptions as gcp_exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +283,20 @@ class S3Service:
                 "flow_id": flow_id,
                 "size": size,
             }
+        except gcp_exceptions.PermissionDenied as exc:
+            logger.error(f"Permission denied uploading to GCS: {exc}")
+            return {"success": False, "error": f"Permission denied: Check service account permissions", "filename": filename}
+        except gcp_exceptions.NotFound as exc:
+            logger.error(f"Bucket not found: {exc}")
+            return {"success": False, "error": f"Storage bucket not found", "filename": filename}
+        except gcp_exceptions.ServiceUnavailable as exc:
+            logger.error(f"GCS service unavailable: {exc}")
+            return {"success": False, "error": f"Cloud storage service temporarily unavailable", "filename": filename}
+        except gcp_exceptions.DeadlineExceeded as exc:
+            logger.error(f"GCS upload timeout: {exc}")
+            return {"success": False, "error": f"Upload timeout: Please try again", "filename": filename}
         except Exception as exc:
+            logger.error(f"GCS upload failed: {exc}", exc_info=True)
             return {"success": False, "error": f"GCS upload failed: {exc}", "filename": filename}
 
     async def check_file_exists(self, s3_key: str) -> bool:
@@ -665,7 +679,11 @@ class S3Service:
                 expiration=timedelta(hours=1),
                 method="GET",
             )
-        except Exception:
+        except gcp_exceptions.PermissionDenied:
+            logger.warning(f"Permission denied generating signed URL for {blob.name}")
+            return f"gs://{self.bucket_name}/{blob.name}"
+        except Exception as e:
+            logger.warning(f"Failed to generate signed URL for {blob.name}: {e}")
             return f"gs://{self.bucket_name}/{blob.name}"
 
     def generate_presigned_url(self, key: str, expiration: int = 3600, method: str = "GET") -> Dict[str, Any]:

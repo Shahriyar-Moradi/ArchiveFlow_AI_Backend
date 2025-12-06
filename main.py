@@ -99,6 +99,122 @@ _FLOWS_CACHE_TTL = 30  # 30 seconds cache TTL
 _browse_docs_cache: Dict[str, tuple] = {}
 _BROWSE_DOCS_CACHE_TTL = 30  # seconds
 
+# ========================================
+# Error Handling Helper Functions
+# ========================================
+
+def check_firestore_available() -> None:
+    """Check if Firestore service is available, raise 503 if not"""
+    if not firestore_service:
+        logger.error("Firestore service not available")
+        raise HTTPException(
+            status_code=503,
+            detail="Firestore service is not available. Please try again later."
+        )
+
+def check_gcs_available() -> None:
+    """Check if GCS service is available, raise 503 if not"""
+    if not gcs_service and not s3_service:
+        logger.error("GCS service not available")
+        raise HTTPException(
+            status_code=503,
+            detail="Cloud storage service is not available. Please try again later."
+        )
+
+def handle_firestore_error(error: Exception, operation: str = "operation") -> HTTPException:
+    """Convert Firestore exceptions to appropriate HTTP responses"""
+    error_str = str(error)
+    error_type = type(error).__name__
+    
+    # Log the error with context
+    logger.error(f"Firestore {operation} error ({error_type}): {error_str}", exc_info=True)
+    
+    # Handle specific error types
+    if "permission" in error_str.lower() or "forbidden" in error_str.lower():
+        return HTTPException(
+            status_code=403,
+            detail=f"Permission denied for Firestore {operation}. Please check service account permissions."
+        )
+    elif "not found" in error_str.lower() or "does not exist" in error_str.lower():
+        return HTTPException(
+            status_code=404,
+            detail=f"Resource not found in Firestore: {error_str}"
+        )
+    elif "deadline" in error_str.lower() or "timeout" in error_str.lower():
+        return HTTPException(
+            status_code=504,
+            detail=f"Firestore {operation} timed out. Please try again."
+        )
+    elif "rate limit" in error_str.lower() or "quota" in error_str.lower():
+        return HTTPException(
+            status_code=429,
+            detail=f"Firestore rate limit exceeded. Please try again later."
+        )
+    elif "unavailable" in error_str.lower() or "connection" in error_str.lower():
+        return HTTPException(
+            status_code=503,
+            detail=f"Firestore service is temporarily unavailable. Please try again later."
+        )
+    else:
+        # Generic error
+        return HTTPException(
+            status_code=500,
+            detail=f"Firestore {operation} failed: {error_str}"
+        )
+
+def handle_gcs_error(error: Exception, operation: str = "operation") -> HTTPException:
+    """Convert GCS exceptions to appropriate HTTP responses"""
+    error_str = str(error)
+    error_type = type(error).__name__
+    
+    # Log the error with context
+    logger.error(f"GCS {operation} error ({error_type}): {error_str}", exc_info=True)
+    
+    # Handle specific error types
+    if "permission" in error_str.lower() or "forbidden" in error_str.lower() or "403" in error_str:
+        return HTTPException(
+            status_code=403,
+            detail=f"Permission denied for GCS {operation}. Please check service account permissions."
+        )
+    elif "not found" in error_str.lower() or "404" in error_str or "does not exist" in error_str.lower():
+        return HTTPException(
+            status_code=404,
+            detail=f"Resource not found in GCS: {error_str}"
+        )
+    elif "deadline" in error_str.lower() or "timeout" in error_str.lower():
+        return HTTPException(
+            status_code=504,
+            detail=f"GCS {operation} timed out. Please try again."
+        )
+    elif "rate limit" in error_str.lower() or "quota" in error_str.lower() or "429" in error_str:
+        return HTTPException(
+            status_code=429,
+            detail=f"GCS rate limit exceeded. Please try again later."
+        )
+    elif "unavailable" in error_str.lower() or "connection" in error_str.lower() or "503" in error_str:
+        return HTTPException(
+            status_code=503,
+            detail=f"Cloud storage service is temporarily unavailable. Please try again later."
+        )
+    else:
+        # Generic error
+        return HTTPException(
+            status_code=500,
+            detail=f"GCS {operation} failed: {error_str}"
+        )
+
+def create_error_response(success: bool = False, error: str = "", error_code: str = "", details: Any = None) -> Dict[str, Any]:
+    """Create standardized error response"""
+    response = {
+        "success": success,
+        "error": error
+    }
+    if error_code:
+        response["errorCode"] = error_code
+    if details is not None:
+        response["details"] = details
+    return response
+
 # Flow files cache for batch details page
 _flow_files_cache: Dict[str, tuple] = {}
 _FLOW_FILES_CACHE_TTL = 15  # 15 seconds TTL (shorter than browse since it changes more frequently)
@@ -334,9 +450,9 @@ class FolderInfo(BaseModel):
 flow_jobs: Dict[str, FlowJob] = {}
 processing_queue: asyncio.Queue = asyncio.Queue()
 
-# Document tracking to prevent duplicates
-processed_documents: Dict[str, Dict[str, Any]] = {}  # document_id -> processing_info
-PROCESSED_DOCS_FILE = BASE_DIR / "processed_documents.json"
+# Document tracking to prevent duplicates - now using Firestore instead of local file
+# Removed: processed_documents dict and PROCESSED_DOCS_FILE
+# All duplicate tracking is now done via Firestore using image_hash field
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -344,8 +460,8 @@ async def lifespan(app: FastAPI):
     # Startup
     print("🚀 Starting Document Processing Backend with GCP...")
 
-    # Load processed documents for duplicate prevention
-    await _load_processed_documents()
+    # Duplicate prevention now uses Firestore (image_hash field) instead of local file
+    logger.info("📂 Using Firestore for duplicate document tracking")
     
     # Verify GCP services are initialized
     if document_processor:
@@ -376,8 +492,8 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     print("🛑 Shutting down Document Processing Backend...")
-    # Save processed documents before shutdown
-    await _save_processed_documents()
+    # All document tracking is now in Firestore, no local file to save
+    logger.info("📂 Document tracking is stored in Firestore")
 
 # Create FastAPI app
 app = FastAPI(
@@ -714,37 +830,20 @@ def _calculate_image_hash(image_data: bytes) -> str:
 
 
 def _check_image_duplicate(image_hash: str) -> Optional[Dict[str, Any]]:
-    """Check if image with this hash already exists in processed documents."""
-    for doc_info in processed_documents.values():
-        if doc_info.get('image_hash') == image_hash:
-            return doc_info
+    """Check if image with this hash already exists in Firestore (for duplicate detection)."""
+    if firestore_service:
+        try:
+            existing_doc = firestore_service.get_document_by_image_hash(image_hash)
+            if existing_doc:
+                logger.info(f"Found duplicate document with image_hash {image_hash[:16]}...")
+                return existing_doc
+        except Exception as e:
+            logger.warning(f"Failed to check duplicate in Firestore: {e}")
     return None
 
 
-async def _save_processed_documents():
-    """Save processed documents to file for persistence."""
-    try:
-        async with aiofiles.open(PROCESSED_DOCS_FILE, 'w') as f:
-            await f.write(json.dumps(processed_documents, indent=2))
-        logger.debug(f"💾 Saved {len(processed_documents)} processed documents to {PROCESSED_DOCS_FILE}")
-    except Exception as e:
-        logger.error(f"❌ Failed to save processed documents: {e}")
-
-
-async def _load_processed_documents():
-    """Load processed documents from file on startup."""
-    global processed_documents
-    try:
-        if PROCESSED_DOCS_FILE.exists():
-            async with aiofiles.open(PROCESSED_DOCS_FILE, 'r') as f:
-                content = await f.read()
-                processed_documents = json.loads(content)
-            logger.info(f"📂 Loaded {len(processed_documents)} processed documents from {PROCESSED_DOCS_FILE}")
-        else:
-            logger.info("📂 No processed documents file found, starting fresh")
-    except Exception as e:
-        logger.error(f"❌ Failed to load processed documents: {e}")
-        processed_documents = {}
+# Removed _save_processed_documents() and _load_processed_documents()
+# All document tracking is now done via Firestore using image_hash field
 
 
 def _target_voucher_dir(voucher_type: str, dt: datetime, branch_dir_name: Optional[str] = None) -> Path:
@@ -858,19 +957,19 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
         image_data = base64.b64decode(doc_data['data'])
         image_hash = _calculate_image_hash(image_data)
         
-        # Check if document was already processed in this session by ID
-        if document_id in processed_documents:
-            logger.info(f"Document {document_id} already processed in this session, skipping")
-            existing_result = processed_documents[document_id]
-            result.success = existing_result.get('success', False)
-            result.document_no = existing_result.get('document_no')
-            result.document_type = existing_result.get('document_type')
-            result.voucher_type = existing_result.get('voucher_type')
-            result.document_date = existing_result.get('document_date')
-            result.folder_path = existing_result.get('folder_path')
-            result.text_file = existing_result.get('text_file')
-            result.image_file = existing_result.get('image_file')
-            return result
+        # Check if document was already processed by checking Firestore
+        # First check by document_id, then by image_hash
+        if firestore_service:
+            existing_doc = firestore_service.get_document(document_id)
+            if existing_doc and existing_doc.get('processing_status') == 'completed':
+                logger.info(f"Document {document_id} already processed in Firestore, skipping")
+                result.success = True
+                result.document_no = existing_doc.get('metadata', {}).get('document_no')
+                result.document_type = existing_doc.get('metadata', {}).get('classification')
+                result.voucher_type = existing_doc.get('metadata', {}).get('ui_category')
+                result.document_date = existing_doc.get('metadata', {}).get('document_date')
+                result.folder_path = existing_doc.get('organized_path', '')
+                return result
         
         # Check if image content already exists (by hash)
         duplicate_info = _check_image_duplicate(image_hash)
@@ -889,14 +988,8 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
             result.text_file = duplicate_info.get('text_file')
             result.image_file = duplicate_info.get('image_file')
             
-            # Track this new document ID as a duplicate
-            processed_documents[document_id] = {
-                'success': False,
-                'error': result.error,
-                'image_hash': image_hash,
-                'processed_at': datetime.now().isoformat(),
-                'duplicate_of': duplicate_info.get('document_no')
-            }
+            # Duplicate tracking is now done in Firestore via image_hash field
+            # No need to store in local processed_documents dict
             return result
         
         # Check if document already exists locally by document number
@@ -926,18 +1019,7 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
                 result.text_file = str(text_candidate) if text_candidate else None
                 result.image_file = str(image_candidate) if image_candidate else None
                 
-                # Track this document
-                processed_documents[document_id] = {
-                    'success': True,
-                    'document_no': document_no,
-                    'document_type': voucher_type,
-                    'voucher_type': voucher_type,
-                    'document_date': None,
-                    'folder_path': str(parent_dir),
-                    'text_file': str(text_candidate) if text_candidate else None,
-                    'image_file': str(image_candidate) if image_candidate else None,
-                    'processed_at': datetime.now().isoformat()
-                }
+                # Document tracking is now in Firestore, no local tracking needed
                 return result
         
         # Save temporary file
@@ -961,20 +1043,22 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
             result.document_date = ocr_result.get('document_date')
             result.voucher_type = ocr_result.get('classification')
             
-            # Validate document number uniqueness
-            if result.document_no:
-                existing_doc_info = next((doc for doc in processed_documents.values() if doc.get('document_no') == result.document_no and doc.get('success')), None)
-                if existing_doc_info:
-                    logger.warning(f"⚠️ Document number {result.document_no} already exists.")
-                    result.success = False
-                    result.error = f"Duplicate document number. A voucher with number '{result.document_no}' already exists."
-                    processed_documents[document_id] = {
-                        'success': False,
-                        'error': result.error,
-                        'image_hash': image_hash,
-                        'processed_at': datetime.now().isoformat()
-                    }
-                    return result
+            # Validate document number uniqueness using Firestore
+            if result.document_no and firestore_service:
+                try:
+                    # Check if document with same document_no already exists
+                    existing_docs, _ = firestore_service.list_documents(
+                        page=1, 
+                        page_size=1,
+                        filters={'document_no': result.document_no}
+                    )
+                    if existing_docs:
+                        logger.warning(f"⚠️ Document number {result.document_no} already exists in Firestore.")
+                        result.success = False
+                        result.error = f"Duplicate document number. A voucher with number '{result.document_no}' already exists."
+                        return result
+                except Exception as e:
+                    logger.warning(f"Failed to check document number uniqueness in Firestore: {e}")
 
             # Determine branch directory name
             ocr_branch_hint = ocr_result.get('branch_id')
@@ -992,35 +1076,15 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
                     result.image_file = pdf_path
                 result.text_file = None  # New processor doesn't create separate text files
             
-            # Track this document to prevent future duplicates
-            processed_documents[document_id] = {
-                'success': True,
-                'document_no': result.document_no,
-                'document_type': result.document_type,
-                'voucher_type': result.voucher_type,
-                'document_date': result.document_date,
-                'folder_path': result.folder_path,
-                'text_file': result.text_file,
-                'image_file': result.image_file,
-                'image_hash': image_hash,
-                'processed_at': datetime.now().isoformat()
-            }
-            
-            # Save processed documents periodically
-            await _save_processed_documents()
+            # Document tracking is now in Firestore (via create_document call)
+            # image_hash is stored in Firestore document for duplicate detection
             
             logger.info(f"✅ Successfully processed document {result.document_no} -> {result.folder_path}")
         else:
             result.error = ocr_result.get('error', 'Unknown error')
             logger.error(f"❌ Failed to process document {doc_data['id']}: {result.error}")
             
-            # Track failed document to prevent retry
-            processed_documents[document_id] = {
-                'success': False,
-                'error': result.error,
-                'image_hash': image_hash, # Can be None if it failed before hash calculation
-                'processed_at': datetime.now().isoformat()
-            }
+            # Failed document status is tracked in Firestore via update_document
     finally:
         # Clean up temp file
         if temp_path.exists():
@@ -1239,8 +1303,7 @@ async def list_agents_batch(
     if not user_is_admin:
         raise HTTPException(status_code=403, detail="Only admins can list agents")
     
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check cache first (cache key includes include_stats flag)
@@ -1519,13 +1582,17 @@ async def aws_upload_file(
             blob = bucket.blob(gcs_temp_path)
             blob.upload_from_string(content, content_type=file.content_type or 'application/octet-stream')
         
+        # Calculate image hash for duplicate detection
+        image_hash = _calculate_image_hash(content)
+        
         # Create Firestore document record
         document_data = {
                 'filename': file.filename,
                 'flow_id': flow_id,
                 'gcs_temp_path': gcs_temp_path,
                 'processing_status': 'pending',
-                'file_size': len(content)
+                'file_size': len(content),
+                'image_hash': image_hash  # Store hash for duplicate detection
         }
         if agent_id:
             document_data['agentId'] = agent_id
@@ -1871,13 +1938,14 @@ async def list_gcs_flows():
         return JSONResponse(content=response_data)
     except Exception as e:
         logger.error(f"Error listing flows: {e}")
-        return JSONResponse(content={
-            "success": True,
-            "flows": [],
-            "count": 0,
-            "message": "Database error",
-            "source": "none"
-        })
+        # Use standardized error response
+        error_response = create_error_response(
+            success=False,
+            error="Failed to list flows",
+            error_code="FLOWS_LIST_ERROR",
+            details=str(e)
+        )
+        return JSONResponse(content=error_response, status_code=500)
 
 
 @app.delete("/api/gcs/flow/{flow_id}")
@@ -1933,9 +2001,16 @@ async def delete_gcs_flow(flow_id: str, delete_temp_files: bool = False):
             "deleted": deleted_items
         })
     
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Error deleting flow {flow_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Error deleting flow {flow_id}: {e}", exc_info=True)
+        error_response = create_error_response(
+            success=False,
+            error=f"Failed to delete flow: {str(e)}",
+            error_code="FLOW_DELETE_ERROR"
+        )
+        raise HTTPException(status_code=500, detail=error_response["error"])
 
 
 @app.get("/api/gcs/flow/{flow_id}/files")
@@ -2035,7 +2110,9 @@ async def get_gcs_flow_files(flow_id: str):
                     logger.info(f"📂 Flow name from Firestore: {flow_name}")
             except Exception as e:
                 logger.warning(f"⚠️  Failed to get Firestore documents: {e}")
+                # Don't fail the entire request, just log and continue with empty list
                 firestore_documents = []
+                # If it's a critical error, we might want to raise, but for now we'll continue
         
         # Process Firestore documents into file lists (optimized)
         temp_files = []
@@ -2236,11 +2313,16 @@ async def get_gcs_flow_files(flow_id: str):
         
         return JSONResponse(content=response_data)
     
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Get GCS flow files error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Get GCS flow files error: {e}", exc_info=True)
+        error_response = create_error_response(
+            success=False,
+            error=f"Failed to get flow files: {str(e)}",
+            error_code="FLOW_FILES_ERROR"
+        )
+        raise HTTPException(status_code=500, detail=error_response["error"])
 
 
 @app.get("/api/gcs/organized-tree/flow/{flow_id}")
@@ -2699,10 +2781,10 @@ async def create_document_metadata(
     """
     try:
         if not firestore_service:
-            raise HTTPException(status_code=503, detail="Firestore service not available")
+            check_firestore_available()
         
         if not s3_service or not s3_service.bucket:
-            raise HTTPException(status_code=503, detail="GCS service not available")
+            check_gcs_available()
         
         # Extract agentId from current user
         agent_id = current_user.get('id')
@@ -2825,10 +2907,10 @@ async def complete_document_upload(
     """
     try:
         if not firestore_service:
-            raise HTTPException(status_code=503, detail="Firestore service not available")
+            check_firestore_available()
         
         if not s3_service or not s3_service.bucket:
-            raise HTTPException(status_code=503, detail="GCS service not available")
+            check_gcs_available()
         
         # Get document from Firestore
         document = firestore_service.get_document(document_id)
@@ -3271,7 +3353,7 @@ async def get_document(folder_name: str, document_name: str):
 async def upload_folder_to_gcs():
     """Upload entire organized_vouchers folder to GCS"""
     if not gcs_service:
-        raise HTTPException(status_code=503, detail="GCS service not available")
+        check_gcs_available()
     
     try:
         result = gcs_service.upload_folder_to_gcs(str(ORGANIZED_DIR))
@@ -3283,7 +3365,7 @@ async def upload_folder_to_gcs():
 async def upload_single_voucher(voucher_type: str, document_no: str, file_path: str):
     """Upload a single voucher file to GCS"""
     if not gcs_service:
-        raise HTTPException(status_code=503, detail="GCS service not available")
+        check_gcs_available()
     
     try:
         result = gcs_service.upload_single_voucher(file_path, voucher_type, document_no)
@@ -3295,7 +3377,7 @@ async def upload_single_voucher(voucher_type: str, document_no: str, file_path: 
 async def list_uploaded_vouchers(prefix: str = ""):
     """List all uploaded vouchers in GCS bucket"""
     if not gcs_service:
-        raise HTTPException(status_code=503, detail="GCS service not available")
+        check_gcs_available()
     
     try:
         vouchers = gcs_service.list_uploaded_vouchers(prefix)
@@ -3311,7 +3393,7 @@ async def list_uploaded_vouchers(prefix: str = ""):
 async def download_voucher_from_gcs(gcs_path: str, local_path: str):
     """Download a voucher from GCS to local storage"""
     if not gcs_service:
-        raise HTTPException(status_code=503, detail="GCS service not available")
+        check_gcs_available()
     
     try:
         result = gcs_service.download_voucher(gcs_path, local_path)
@@ -3337,13 +3419,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/document/{document_id}/status")
 async def get_document_status(document_id: str):
-    """Get processing status of a specific document"""
-    if document_id in processed_documents:
+    """Get processing status of a specific document from Firestore"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore service not available")
+    
+    doc = firestore_service.get_document(document_id)
+    if doc:
         return JSONResponse(content={
             "success": True,
             "document_id": document_id,
-            "status": "processed",
-            "data": processed_documents[document_id]
+            "status": doc.get('processing_status', 'unknown'),
+            "data": doc
         })
     else:
         return JSONResponse(content={
@@ -3354,12 +3440,18 @@ async def get_document_status(document_id: str):
         })
 
 @app.get("/api/documents/processed")
-async def get_processed_documents():
-    """Get list of all processed documents"""
+async def get_processed_documents(page: int = 1, page_size: int = 100):
+    """Get list of all processed documents from Firestore"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore service not available")
+    
+    documents, total = firestore_service.list_documents(page=page, page_size=page_size)
     return JSONResponse(content={
         "success": True,
-        "total_processed": len(processed_documents),
-        "documents": processed_documents
+        "total_processed": total,
+        "page": page,
+        "page_size": page_size,
+        "documents": documents
     })
 
 # AWS API endpoints
@@ -5574,8 +5666,7 @@ async def get_batch_documents(batch_id: str):
 @app.get("/api/dynamodb/documents/{document_id}")
 async def get_document_details(document_id: str, batch_id: str):
     """Get specific document details from Firestore (replaces DynamoDB)"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # URL decode the document_id in case it was encoded
@@ -5608,8 +5699,7 @@ async def create_flow_endpoint(
     source: str = Body(default='web')
 ):
     """Create new flow in Firestore (replaces DynamoDB)"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Generate unique flow ID
@@ -5683,8 +5773,7 @@ async def list_flows_endpoint(status: Optional[str] = None, limit: int = 50):
 @app.get("/api/flows/{flow_id}")
 async def get_flow_details_endpoint(flow_id: str):
     """Get specific flow details from Firestore (replaces DynamoDB)"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         flow = firestore_service.get_flow(flow_id)
@@ -6060,8 +6149,7 @@ async def get_flow_vouchers_endpoint(flow_id: str, limit: int = 100):
 @app.delete("/api/flows/{flow_id}")
 async def delete_flow_endpoint(flow_id: str):
     """Delete a flow from Firestore (replaces DynamoDB)"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Note: Firestore service doesn't have delete_flow method yet
@@ -6091,8 +6179,7 @@ async def list_clients_batch(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """List clients with their agents and properties in a single optimized query. Cached for 30 seconds."""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check cache first
@@ -6119,6 +6206,16 @@ async def list_clients_batch(
             cursor_doc_id=cursor,
             agent_id=target_agent_id
         )
+        
+        # Auto-assign agents for clients without assigned agents
+        for client in clients:
+            if not client.get('agent') or not client['agent'].get('id'):
+                # Client has no agent assigned, auto-assign based on current_user
+                client_id = client.get('id')
+                if client_id:
+                    agent_id = firestore_service.auto_assign_agent_to_client(client_id, current_user)
+                    if agent_id:
+                        logger.info(f"Auto-assigned agent {agent_id} to client {client_id} during listing")
         
         # Enrich agent data from simple_auth
         from simple_auth import simple_auth
@@ -6162,8 +6259,7 @@ async def list_clients(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """List all clients with pagination. Admins see all, agents see only their clients."""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if user is admin
@@ -6197,15 +6293,27 @@ async def list_clients(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/clients")
-async def create_client(client_data: Dict[str, Any] = Body(...)):
-    """Create a new client"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+async def create_client(
+    client_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Create a new client and automatically assign agent based on logged-in user"""
+    check_firestore_available()
     
     try:
         client_id = str(uuid.uuid4())
         client_data['id'] = client_id
+        
+        # Create the client first
         firestore_service.create_client(client_id, client_data)
+        
+        # Automatically assign agent based on logged-in user
+        agent_id = firestore_service.auto_assign_agent_to_client(client_id, current_user)
+        if agent_id:
+            logger.info(f"Automatically assigned agent {agent_id} to client {client_id}")
+            # Update client_data to include agent_id in response
+            client_data['agent_id'] = agent_id
+        
         return JSONResponse(content={
             "success": True,
             "client_id": client_id,
@@ -6218,8 +6326,7 @@ async def create_client(client_data: Dict[str, Any] = Body(...)):
 @app.get("/api/clients/{client_id}")
 async def get_client(client_id: str):
     """Get client details"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         client = firestore_service.get_client(client_id)
@@ -6238,8 +6345,7 @@ async def get_client(client_id: str):
 @app.put("/api/clients/{client_id}")
 async def update_client(client_id: str, client_data: Dict[str, Any] = Body(...)):
     """Update a client"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         success = firestore_service.update_client(client_id, client_data)
@@ -6255,8 +6361,7 @@ async def update_client(client_id: str, client_data: Dict[str, Any] = Body(...))
 @app.delete("/api/clients/{client_id}")
 async def delete_client(client_id: str):
     """Delete a client"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if client exists
@@ -6279,8 +6384,7 @@ async def delete_client(client_id: str):
 @app.get("/api/clients/{client_id}/property-files")
 async def get_client_property_files(client_id: str):
     """Get all property files for a client"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         property_files = firestore_service.get_property_files_by_client(client_id)
@@ -6295,8 +6399,7 @@ async def get_client_property_files(client_id: str):
 @app.get("/api/clients/{client_id}/agent")
 async def get_client_agent(client_id: str):
     """Get the agent who uploaded the most documents for a client"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if client exists
@@ -6355,8 +6458,7 @@ async def get_client_agent(client_id: str):
 @app.get("/api/clients/{client_id}/properties")
 async def get_client_properties(client_id: str):
     """Get all properties related to a client through property files"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if client exists
@@ -6379,8 +6481,7 @@ async def get_client_properties(client_id: str):
 @app.get("/api/clients/{client_id}/full")
 async def get_client_full(client_id: str):
     """Get client with all related data (agent, properties, property_files) in one call. Cached for 60 seconds."""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check cache first
@@ -6437,8 +6538,7 @@ async def list_properties(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """List all properties with pagination. Admins see all, agents see only their properties."""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if user is admin
@@ -6477,8 +6577,7 @@ async def create_property(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Create a new property"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Extract agentId from current user
@@ -6506,8 +6605,7 @@ async def create_property(
 @app.get("/api/properties/{property_id}")
 async def get_property(property_id: str):
     """Get property details"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         property_obj = firestore_service.get_property(property_id)
@@ -6526,8 +6624,7 @@ async def get_property(property_id: str):
 @app.get("/api/properties/{property_id}/property-files")
 async def get_property_property_files(property_id: str):
     """Get all property files for a property"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         property_files = firestore_service.get_property_files_by_property(property_id)
@@ -6542,8 +6639,7 @@ async def get_property_property_files(property_id: str):
 @app.get("/api/properties/{property_id}/agent")
 async def get_property_agent(property_id: str):
     """Get the managing agent for a property"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         property_obj = firestore_service.get_property(property_id)
@@ -6590,8 +6686,7 @@ async def list_agents(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """List all agents with pagination"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         agents, total = firestore_service.list_agents(
@@ -6616,8 +6711,7 @@ async def create_agent(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Create a new agent"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         agent_id = str(uuid.uuid4())
@@ -6635,8 +6729,7 @@ async def create_agent(
 @app.get("/api/agents/{agent_id}")
 async def get_agent(agent_id: str):
     """Get agent details"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         agent = firestore_service.get_agent(agent_id)
@@ -6659,8 +6752,7 @@ async def update_agent(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Update an agent"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         success = firestore_service.update_agent(agent_id, agent_data)
@@ -6682,8 +6774,7 @@ async def delete_agent(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Delete an agent"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         success = firestore_service.delete_agent(agent_id)
@@ -6713,8 +6804,7 @@ async def list_deals(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """List all deals with filters and pagination"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         deals, total = firestore_service.list_deals(
@@ -6743,8 +6833,7 @@ async def create_deal(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Create a new deal"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         deal_id = str(uuid.uuid4())
@@ -6762,8 +6851,7 @@ async def create_deal(
 @app.get("/api/deals/{deal_id}")
 async def get_deal(deal_id: str):
     """Get deal details"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         deal = firestore_service.get_deal(deal_id)
@@ -6794,8 +6882,7 @@ async def update_deal(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Update a deal"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         success = firestore_service.update_deal(deal_id, deal_data)
@@ -6817,8 +6904,7 @@ async def delete_deal(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Delete a deal"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         success = firestore_service.delete_deal(deal_id)
@@ -6845,8 +6931,7 @@ async def get_agent_properties(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Get all properties managed by a specific agent"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     # Check if user is admin or viewing their own data
     user_is_admin = current_user.get('role') == 'admin' or current_user.get('id') == 'demo_admin_user' or current_user.get('email') == 'admin@example.com'
@@ -6880,8 +6965,7 @@ async def get_agent_documents(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Get all documents uploaded by a specific agent"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     # Check if user is admin or viewing their own data
     user_is_admin = current_user.get('role') == 'admin' or current_user.get('id') == 'demo_admin_user' or current_user.get('email') == 'admin@example.com'
@@ -6915,8 +6999,7 @@ async def get_agent_clients(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Get all clients related to documents uploaded by a specific agent"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     # Check if user is admin or viewing their own data
     user_is_admin = current_user.get('role') == 'admin' or current_user.get('id') == 'demo_admin_user' or current_user.get('email') == 'admin@example.com'
@@ -6954,8 +7037,7 @@ async def list_property_files(
     cursor: Optional[str] = None
 ):
     """List property files with filters"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         property_files, total = firestore_service.list_property_files(
@@ -6981,8 +7063,7 @@ async def list_property_files(
 @app.get("/api/property-files/{property_file_id}")
 async def get_property_file(property_file_id: str):
     """Get property file details with linked documents"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         property_file = firestore_service.get_property_file(property_file_id)
@@ -7019,8 +7100,7 @@ async def get_property_file(property_file_id: str):
 @app.put("/api/property-files/{property_file_id}")
 async def update_property_file(property_file_id: str, property_file_data: Dict[str, Any] = Body(...)):
     """Update a property file"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if property file exists
@@ -7043,8 +7123,7 @@ async def update_property_file(property_file_id: str, property_file_data: Dict[s
 @app.delete("/api/property-files/{property_file_id}")
 async def delete_property_file(property_file_id: str):
     """Delete a property file"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         # Check if property file exists
@@ -7067,8 +7146,7 @@ async def delete_property_file(property_file_id: str):
 @app.post("/api/property-files/match-unlinked")
 async def match_unlinked_documents(request_data: Dict[str, Any] = Body(...)):
     """Match unlinked documents to property files based on client name"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         from services.matching_service import MatchingService
@@ -7162,8 +7240,7 @@ async def match_unlinked_documents(request_data: Dict[str, Any] = Body(...)):
 @app.post("/api/property-files/from-spa")
 async def create_property_file_from_spa(request_data: Dict[str, Any] = Body(...)):
     """Internal: Create property file from SPA document (legacy endpoint - now handled by _find_or_create_property_file)"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         document_id = request_data.get('document_id')
@@ -7283,8 +7360,7 @@ async def create_property_file_from_spa(request_data: Dict[str, Any] = Body(...)
 @app.post("/api/property-files/auto-attach")
 async def auto_attach_document(request_data: Dict[str, Any] = Body(...)):
     """Internal: Auto-attach document to property file"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         from services.matching_service import MatchingService
@@ -7415,8 +7491,7 @@ async def attach_document_to_property_file(
     request_data: Dict[str, Any] = Body(...)
 ):
     """Manually attach a document to a property file"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore not available")
+    check_firestore_available()
     
     try:
         document_id = request_data.get('document_id')
@@ -7682,7 +7757,7 @@ async def health_check():
         "task_queue": "ready" if task_queue else "not initialized",
         "active_jobs": 0,  # Legacy batch_jobs removed
         "queue_size": processing_queue.qsize(),
-        "processed_documents": len(processed_documents)
+        "processed_documents": firestore_service.get_document_count() if firestore_service else 0
     }
 
 @app.post("/api/sync/s3-to-database")
