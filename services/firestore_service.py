@@ -5,7 +5,9 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from google.cloud import firestore
-from google.cloud.firestore import Query, FieldFilter, FieldPath
+from google.cloud import firestore
+from google.cloud.firestore import FieldFilter, Query
+from google.cloud.firestore_v1.field_path import FieldPath
 
 import sys
 from pathlib import Path
