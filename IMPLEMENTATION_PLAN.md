@@ -155,7 +155,7 @@ api.interceptors.request.use(async (config) => {
 2. Implement Firestore client dependency and Pydantic models.
 3. Wire document upload endpoint and background AI processing hook to classify and link documents.
 4. Build React pages and API clients per entity; add property file checklist UI.
-5. Set up Cloud Run deployment and Firebase Hosting; verify Firestore access and auth token flow (ensure service accounts are bound correctly and Firebase ID tokens are accepted end-to-end).
+5. Set up Cloud Run deployment and Firebase Hosting; verify Firestore access and auth token flow (ensure service accounts are bound correctly and Firebase ID tokens are accepted end-to-end, including IAM roles for Firestore/Storage and backend token verification paths).
 
 ## 9. Firestore optimizations already implemented (and why)
 
