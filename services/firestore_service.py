@@ -1259,11 +1259,27 @@ class FirestoreService:
     def get_property_files_by_client(self, client_id: str) -> List[Dict[str, Any]]:
         """Get all property files for a client"""
         try:
-            query = self.property_files_collection.where(
-                filter=FieldFilter('client_id', '==', client_id)
-            ).order_by('created_at', direction=Query.DESCENDING)
+            # Try query with order_by first (requires composite index)
+            try:
+                query = self.property_files_collection.where(
+                    filter=FieldFilter('client_id', '==', client_id)
+                ).order_by('created_at', direction=Query.DESCENDING)
+                docs = list(query.stream())
+            except Exception as index_error:
+                # If index error, fall back to query without order_by
+                if 'index' in str(index_error).lower() or '400' in str(index_error):
+                    logger.warning(f"Index not available for property_files query, using fallback without order_by: {index_error}")
+                    query = self.property_files_collection.where(
+                        filter=FieldFilter('client_id', '==', client_id)
+                    )
+                    docs = list(query.stream())
+                    # Sort in memory by created_at descending
+                    docs_list = [(doc, doc.to_dict().get('created_at')) for doc in docs]
+                    docs_list.sort(key=lambda x: x[1] or 0, reverse=True)
+                    docs = [doc for doc, _ in docs_list]
+                else:
+                    raise
             
-            docs = list(query.stream())
             property_files = []
             for doc in docs:
                 data = doc.to_dict()
@@ -1295,11 +1311,27 @@ class FirestoreService:
     def get_property_files_by_property(self, property_id: str) -> List[Dict[str, Any]]:
         """Get all property files for a property"""
         try:
-            query = self.property_files_collection.where(
-                filter=FieldFilter('property_id', '==', property_id)
-            ).order_by('created_at', direction=Query.DESCENDING)
+            # Try query with order_by first (requires composite index)
+            try:
+                query = self.property_files_collection.where(
+                    filter=FieldFilter('property_id', '==', property_id)
+                ).order_by('created_at', direction=Query.DESCENDING)
+                docs = list(query.stream())
+            except Exception as index_error:
+                # If index error, fall back to query without order_by
+                if 'index' in str(index_error).lower() or '400' in str(index_error):
+                    logger.warning(f"Index not available for property_files query by property, using fallback without order_by: {index_error}")
+                    query = self.property_files_collection.where(
+                        filter=FieldFilter('property_id', '==', property_id)
+                    )
+                    docs = list(query.stream())
+                    # Sort in memory by created_at descending
+                    docs_list = [(doc, doc.to_dict().get('created_at')) for doc in docs]
+                    docs_list.sort(key=lambda x: x[1] or 0, reverse=True)
+                    docs = [doc for doc, _ in docs_list]
+                else:
+                    raise
             
-            docs = list(query.stream())
             property_files = []
             for doc in docs:
                 data = doc.to_dict()
@@ -1550,13 +1582,86 @@ class FirestoreService:
         page_size: int = 20,
         cursor_doc_id: Optional[str] = None
     ) -> tuple[List[Dict[str, Any]], int]:
-        """List all clients related to deals for a specific agent (optimized using deals collection)"""
+        """List all clients related to a specific agent through deals, property files, documents, or stored agent_id"""
         try:
-            # Use deals collection for efficient querying
-            deals = self.get_deals_by_agent(agent_id)
+            client_ids = set()
             
-            # Extract unique client IDs from deals
-            client_ids = {deal.get('clientId') for deal in deals if deal.get('clientId')}
+            # Method 1: Get clients from deals collection
+            try:
+                deals = self.get_deals_by_agent(agent_id)
+                for deal in deals:
+                    client_id = deal.get('clientId')
+                    if client_id:
+                        client_ids.add(client_id)
+            except Exception as e:
+                logger.warning(f"Error getting clients from deals for agent {agent_id}: {e}")
+            
+            # Method 2: Get clients from property files with this agent_id
+            try:
+                property_files_query = self.property_files_collection.where(
+                    filter=FieldFilter('agent_id', '==', agent_id)
+                )
+                property_files = list(property_files_query.stream())
+                for pf_doc in property_files:
+                    pf_data = pf_doc.to_dict()
+                    client_id = pf_data.get('client_id')
+                    if client_id:
+                        client_ids.add(client_id)
+            except Exception as e:
+                logger.warning(f"Error getting clients from property files for agent {agent_id}: {e}")
+            
+            # Method 3: Get clients from documents with this agentId
+            try:
+                documents_query = self.documents_collection.where(
+                    filter=FieldFilter('agentId', '==', agent_id)
+                ).limit(1000)  # Limit to avoid timeout
+                documents = list(documents_query.stream())
+                for doc in documents:
+                    doc_data = doc.to_dict()
+                    client_id = doc_data.get('clientId') or doc_data.get('client_id')
+                    if client_id:
+                        client_ids.add(client_id)
+            except Exception as e:
+                logger.warning(f"Error getting clients from documents for agent {agent_id}: {e}")
+            
+            # Method 4: Get clients with stored agent_id matching this agent
+            try:
+                clients_query = self.clients_collection.where(
+                    filter=FieldFilter('agent_id', '==', agent_id)
+                )
+                clients_with_agent = list(clients_query.stream())
+                for client_doc in clients_with_agent:
+                    client_ids.add(client_doc.id)
+            except Exception as e:
+                logger.warning(f"Error getting clients with stored agent_id for agent {agent_id}: {e}")
+            
+            # Method 5: Get clients through properties managed by this agent
+            # If agent manages a property, find clients that have property files for those properties
+            try:
+                # First get properties managed by this agent
+                properties_query = self.properties_collection.where(
+                    filter=FieldFilter('agentId', '==', agent_id)
+                ).limit(100)  # Limit to avoid timeout
+                agent_properties = list(properties_query.stream())
+                property_ids = {prop.id for prop in agent_properties}
+                
+                if property_ids:
+                    # Find property files for these properties
+                    # Use chunked queries since Firestore IN limit is 10
+                    chunk_size = 10
+                    for i in range(0, len(list(property_ids)), chunk_size):
+                        property_chunk = list(property_ids)[i:i + chunk_size]
+                        pf_query = self.property_files_collection.where(
+                            filter=FieldFilter('property_id', 'in', property_chunk)
+                        )
+                        property_files = list(pf_query.stream())
+                        for pf_doc in property_files:
+                            pf_data = pf_doc.to_dict()
+                            client_id = pf_data.get('client_id')
+                            if client_id:
+                                client_ids.add(client_id)
+            except Exception as e:
+                logger.warning(f"Error getting clients through properties for agent {agent_id}: {e}")
             
             if not client_ids:
                 return [], 0
@@ -1576,6 +1681,8 @@ class FirestoreService:
             return paginated_clients, total
         except Exception as e:
             logger.error(f"Failed to list clients by agent: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return [], 0
     
     def get_client_agent(self, client_id: str) -> Optional[Dict[str, Any]]:
@@ -1815,6 +1922,133 @@ class FirestoreService:
             logger.error(traceback.format_exc())
             return []
     
+    def sync_clients_from_property_files(self) -> int:
+        """Sync clients from property files that have client_full_name but no valid client_id.
+        Returns the number of clients created.
+        Optimized to limit processing and avoid performance issues."""
+        try:
+            import uuid
+            created_count = 0
+            
+            # Limit the sync to avoid performance issues - only process first 50 property files
+            # This prevents timeouts when there are many property files
+            MAX_SYNC_LIMIT = 50
+            
+            # Get a limited number of property files to check
+            # We'll process them and filter in memory for those needing sync
+            try:
+                query = self.property_files_collection.limit(MAX_SYNC_LIMIT)
+            except Exception as e:
+                logger.warning(f"Could not access property_files collection: {e}")
+                return 0
+            
+            property_files_to_check = []
+            for pf_doc in query.stream():
+                pf_data = pf_doc.to_dict()
+                client_full_name = pf_data.get('client_full_name')
+                client_id = pf_data.get('client_id')
+                
+                if not client_full_name or not client_full_name.strip():
+                    continue
+                
+                # Only process if client_id is missing
+                if not client_id:
+                    property_files_to_check.append({
+                        'id': pf_doc.id,
+                        'data': pf_data,
+                        'client_full_name': client_full_name
+                    })
+                else:
+                    # Quick check: verify client actually exists (only check first few to avoid slowdown)
+                    if len(property_files_to_check) < 10:  # Only verify for first 10 to avoid too many DB calls
+                        client = self.get_client(client_id)
+                        if not client:
+                            property_files_to_check.append({
+                                'id': pf_doc.id,
+                                'data': pf_data,
+                                'client_full_name': client_full_name
+                            })
+            
+            if not property_files_to_check:
+                logger.info("No property files need client sync (within limit)")
+                return 0
+            
+            # Track unique client names that need client records
+            client_names_to_sync = {}  # {client_full_name: [property_file_data]}
+            
+            for pf_info in property_files_to_check:
+                client_full_name = pf_info['client_full_name']
+                if client_full_name not in client_names_to_sync:
+                    client_names_to_sync[client_full_name] = []
+                client_names_to_sync[client_full_name].append(pf_info)
+            
+            # For each unique client name, find or create client
+            for client_full_name, property_files in client_names_to_sync.items():
+                # Normalize the name for better matching
+                normalized_name = client_full_name.lower().strip()
+                
+                # Search for existing client by name (prefix match)
+                existing_clients = self.search_clients_by_name(client_full_name)
+                
+                # Also try exact match by checking all clients (for cases where prefix match doesn't work)
+                client_id = None
+                if existing_clients:
+                    # Check if any existing client matches exactly (case-insensitive)
+                    for existing_client in existing_clients:
+                        if existing_client.get('full_name', '').lower().strip() == normalized_name:
+                            client_id = existing_client['id']
+                            logger.info(f"Found existing client {client_id} for exact name match '{client_full_name}'")
+                            break
+                    
+                    # If no exact match, use the first matching client (best match from prefix search)
+                    if not client_id and existing_clients:
+                        client_id = existing_clients[0]['id']
+                        logger.info(f"Found existing client {client_id} for name '{client_full_name}' (prefix match)")
+                
+                if not client_id:
+                    # Create new client
+                    client_id = str(uuid.uuid4())
+                    client_data = {
+                        'id': client_id,
+                        'full_name': client_full_name,
+                        'created_from': 'property_file_sync'
+                    }
+                    
+                    # Try to get agent_id from property files
+                    agent_id = None
+                    for pf_info in property_files:
+                        pf_data = pf_info['data']
+                        agent_id = pf_data.get('agent_id') or pf_data.get('agentId')
+                        if agent_id:
+                            break
+                    
+                    if agent_id:
+                        client_data['agent_id'] = agent_id
+                    
+                    self.create_client(client_id, client_data)
+                    created_count += 1
+                    logger.info(f"Created new client {client_id} for name '{client_full_name}' from property files")
+                
+                # Update all property files with the client_id
+                for pf_info in property_files:
+                    pf_id = pf_info['id']
+                    pf_data = pf_info['data']
+                    
+                    # Only update if client_id is missing or different
+                    if pf_data.get('client_id') != client_id:
+                        self.update_property_file_client_id(pf_id, client_id)
+                        logger.info(f"Updated property file {pf_id} with client_id {client_id}")
+            
+            if created_count > 0:
+                logger.info(f"Synced {created_count} new clients from property files")
+            
+            return created_count
+        except Exception as e:
+            logger.error(f"Failed to sync clients from property files: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 0
+    
     def list_clients_with_relations(
         self,
         page: int = 1,
@@ -1829,6 +2063,23 @@ class FirestoreService:
                 clients, total = self.list_clients_by_agent(agent_id, page, page_size, cursor_doc_id)
             else:
                 clients, total = self.list_clients(page, page_size, cursor_doc_id)
+            
+            # If no clients found and we're on the first page, try syncing from property files
+            # This handles the case where property files have client names but no client records exist
+            if not clients and page == 1:
+                try:
+                    logger.info("No clients found, attempting to sync clients from property files...")
+                    created_count = self.sync_clients_from_property_files()
+                    if created_count > 0:
+                        # Retry fetching clients after sync
+                        if agent_id:
+                            clients, total = self.list_clients_by_agent(agent_id, page, page_size, cursor_doc_id)
+                        else:
+                            clients, total = self.list_clients(page, page_size, cursor_doc_id)
+                except Exception as sync_error:
+                    # Don't fail the entire request if sync fails - just log and continue
+                    logger.warning(f"Failed to sync clients from property files (non-fatal): {sync_error}")
+                    # Continue with empty clients list
             
             if not clients:
                 return [], total
@@ -1872,7 +2123,7 @@ class FirestoreService:
                             client = next((c for c in clients if c['id'] == client_id), None)
                             if client and client.get('full_name'):
                                 try:
-                                    # Search property files by client_full_name
+                                    # Search property files by client_full_name (without order_by to avoid index requirement)
                                     query = self.property_files_collection.where(
                                         filter=FieldFilter('client_full_name', '==', client.get('full_name'))
                                     ).limit(10)  # Limit to avoid too many results
@@ -1897,9 +2148,19 @@ class FirestoreService:
                                             property_files_by_client[client_id] = []
                                         property_files_by_client[client_id].append(pf_data)
                                 except Exception as e:
-                                    logger.warning(f"Error checking property files by name for client {client_id}: {e}")
+                                    # Handle index errors gracefully - log as warning, not error
+                                    error_str = str(e).lower()
+                                    if 'index' in error_str or '400' in error_str:
+                                        logger.warning(f"Index not available for property_files query by client_full_name (non-fatal): {e}")
+                                    else:
+                                        logger.warning(f"Error checking property files by name for client {client_id}: {e}")
             except Exception as e:
-                logger.warning(f"Error fetching property files in batch: {e}")
+                # Handle index errors gracefully - log as warning, not error
+                error_str = str(e).lower()
+                if 'index' in error_str or '400' in error_str:
+                    logger.warning(f"Index not available for property_files batch query (non-fatal): {e}")
+                else:
+                    logger.warning(f"Error fetching property files in batch: {e}")
                 property_files_by_client = {}
             
             # Extract unique property IDs from all property files and batch fetch
@@ -1974,6 +2235,9 @@ class FirestoreService:
                 
                 # Attach properties
                 client['properties'] = client_properties_map.get(client_id, [])
+                
+                # Attach property files count
+                client['property_file_count'] = len(property_files_by_client.get(client_id, []))
             
             return clients, total
         except Exception as e:
