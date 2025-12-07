@@ -161,7 +161,7 @@ api.interceptors.request.use(async (config) => {
 
 We tuned the agent/client/property flows to avoid slow list endpoints and excessive reads:
 
-- **Count aggregation instead of full scans.** List endpoints (clients, properties, agents, and agent-scoped views) now call a shared `_get_query_count` helper that uses Firestore's aggregation queries. This returns real totals without loading every document; if the environment does not support aggregation, the helper safely falls back to `-1` so the API stays responsive instead of timing out.
+- **Count aggregation instead of full scans.** List endpoints (clients, properties, agents, and agent-scoped views) now call a shared `_get_query_count` helper that uses Firestore's aggregation queries. This returns real totals without loading every document; if the environment does not support aggregation, the helper safely falls back to `-1` so the API stays responsive instead of timing out. This is the canonical guidance (no merge artifacts remain).
 - **Chunked `IN` fetches for related entities.** When an agent listing needs the properties or clients tied to their deals, we gather the related IDs and fetch them in batches of 10 using `document_id IN` queries. This eliminates N network round-trips (one per document) and keeps pagination fast even as relationships grow.
 
 How to apply these patterns elsewhere:

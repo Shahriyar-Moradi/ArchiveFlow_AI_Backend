@@ -19,10 +19,9 @@ logger = logging.getLogger(__name__)
 def _get_query_count(query: Query) -> int:
     """Return the total number of documents for a query using aggregation.
 
-    Rationale (merging the prior conflicting guidance):
-    - List endpoints for agents, clients, and properties need accurate totals
-      for pagination, but fetching every document to compute `len()` is slow and
-      expensive.
+    Rationale:
+    - List endpoints need accurate totals for pagination, but fetching every
+      document to compute `len()` is slow and expensive.
     - Firestore's count aggregation runs server-side and only returns the count
       metadata, keeping responses fast.
     - If aggregation is unsupported (older emulator/SDK) or fails, we fall back
