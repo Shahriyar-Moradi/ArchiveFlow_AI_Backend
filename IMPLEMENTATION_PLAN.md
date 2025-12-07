@@ -155,4 +155,20 @@ api.interceptors.request.use(async (config) => {
 2. Implement Firestore client dependency and Pydantic models.
 3. Wire document upload endpoint and background AI processing hook to classify and link documents.
 4. Build React pages and API clients per entity; add property file checklist UI.
+5. Set up Cloud Run deployment and Firebase Hosting; verify Firestore access and auth token flow (ensure service accounts are bound correctly and Firebase ID tokens are accepted end-to-end, including IAM roles for Firestore/Storage and backend token verification paths).
+
+## 9. Firestore optimizations already implemented (and why)
+
+We tuned the agent/client/property flows to avoid slow list endpoints and excessive reads:
+
+- **Count aggregation instead of full scans.** List endpoints (clients, properties, agents, and agent-scoped views) now call a shared `_get_query_count` helper that uses Firestore's aggregation queries. This returns real totals without loading every document; if the environment does not support aggregation, the helper safely falls back to `-1` so the API stays responsive instead of timing out. This is the canonical guidance (no merge artifacts remain).
+- **Chunked `IN` fetches for related entities.** When an agent listing needs the properties or clients tied to their deals, we gather the related IDs and fetch them in batches of 10 using `document_id IN` queries. This eliminates N network round-trips (one per document) and keeps pagination fast even as relationships grow.
+
+How to apply these patterns elsewhere:
+
+1) When adding a new listing endpoint, build the base query first, call `_get_query_count` to compute totals, then apply cursor/offset and `limit`. This keeps list responses accurate without extra scans.
+
+2) When you need to hydrate many referenced docs (e.g., properties for a list of deals), collect their IDs and reuse `_fetch_documents_by_ids(collection, ids)` to retrieve them in minimal batches. Do **not** loop over `.document(id).get()` calls.
+
+Both helpers live in `services/firestore_service.py` and are safe to reuse across new routers or background jobs.
 5. Set up Cloud Run deployment and Firebase Hosting; verify Firestore access and auth token flow.

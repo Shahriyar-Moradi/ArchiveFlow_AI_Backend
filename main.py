@@ -1916,6 +1916,10 @@ async def delete_gcs_flow(flow_id: str, delete_temp_files: bool = False):
 async def get_gcs_flow_files(flow_id: str):
     """Get all files for a specific flow from Firestore (primary) with GCS fallback. Optimized for performance."""
     try:
+        # Normalize the flow_id early so GCS prefixes and Firestore lookups align even if the
+        # frontend included accidental whitespace.
+        flow_id = (flow_id or "").strip()
+
         # Cleanup old cache entries periodically
         _cleanup_cache(_flow_files_cache, _FLOW_FILES_CACHE_TTL)
         
@@ -2126,6 +2130,7 @@ async def get_gcs_flow_files(flow_id: str):
             gcs_result = s3_service.get_flow_files_from_s3(flow_id)
         except Exception as gcs_error:
             logger.warning(f"⚠️  Failed to list flow files from GCS for reconciliation: {gcs_error}")
+            gcs_result = {"success": False, "error": str(gcs_error)}
             gcs_result = {"success": False}
 
         if gcs_result.get('success'):
@@ -2252,13 +2257,22 @@ async def get_gcs_flow_files(flow_id: str):
             },
             'source': 'firestore' if firestore_documents else 'gcs_fallback'
         }
+
+        # Surface reconciliation errors so callers can prompt a retry instead of silently
+        # returning an empty payload when neither Firestore nor GCS returned data.
+        if not firestore_documents and not gcs_result.get('success'):
+            response_data['success'] = False
+            response_data['error'] = gcs_result.get('error', 'Unknown error while listing flow files')
         
         logger.info(f"✅ Retrieved {total} files for flow {flow_id} from {'Firestore' if firestore_documents else 'GCS'}")
         logger.info(f"   - Organized: {organized_count}, Temp: {len(temp_files)}, Pending: {len(pending_files)}, Failed: {len(failed_files)}")
         
-        # Cache the result
-        _flow_files_cache[cache_key] = (response_data, now)
-        
+        # Cache the result only when we have something to serve; if totals are zero or the
+        # data sources failed, skip caching so the next request can see newly arriving files
+        # without waiting for the TTL to expire.
+        if total > 0 or firestore_documents or gcs_result.get('success'):
+            _flow_files_cache[cache_key] = (response_data, now)
+
         return JSONResponse(content=response_data)
     
     except Exception as e:
@@ -2734,6 +2748,9 @@ async def create_document_metadata(
         if not agent_id:
             raise HTTPException(status_code=401, detail="User not authenticated")
         
+        # Normalize flow_id to avoid accidental whitespace mismatches in prefixes
+        flow_id = (flow_id or "").strip()
+
         # Ensure flow exists in Firestore
         _ensure_flow_exists(flow_id, flow_name)
         
@@ -2909,7 +2926,7 @@ async def complete_document_upload(
 
 @app.post("/api/gcs/upload-files")
 async def gcs_upload_files(
-    files: List[UploadFile] = File(...), 
+    files: List[UploadFile] = File(...),
     flow_id: Optional[str] = Form(None),
     flow_name: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -2933,8 +2950,9 @@ async def gcs_upload_files(
     except Exception as e:
         logger.debug(f"Could not extract agent ID from request: {e}")
 
-    # Ensure flow_id exists if provided; otherwise generate one
-    final_flow_id = flow_id or f"flow-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Ensure flow_id exists if provided; otherwise generate one. Strip whitespace to avoid
+    # prefix mismatches that would hide uploads when listing flow files.
+    final_flow_id = (flow_id or "").strip() or f"flow-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Ensure flow exists in Firestore before uploading documents
     # Use provided flow_name if available, otherwise it will default to "Uploaded Flow"
