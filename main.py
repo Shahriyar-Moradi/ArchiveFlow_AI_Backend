@@ -2131,6 +2131,7 @@ async def get_gcs_flow_files(flow_id: str):
         except Exception as gcs_error:
             logger.warning(f"⚠️  Failed to list flow files from GCS for reconciliation: {gcs_error}")
             gcs_result = {"success": False, "error": str(gcs_error)}
+            gcs_result = {"success": False}
 
         if gcs_result.get('success'):
             def _identifiers(file_data: Dict[str, Any]) -> List[str]:

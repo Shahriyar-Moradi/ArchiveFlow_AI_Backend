@@ -171,3 +171,4 @@ How to apply these patterns elsewhere:
 2) When you need to hydrate many referenced docs (e.g., properties for a list of deals), collect their IDs and reuse `_fetch_documents_by_ids(collection, ids)` to retrieve them in minimal batches. Do **not** loop over `.document(id).get()` calls.
 
 Both helpers live in `services/firestore_service.py` and are safe to reuse across new routers or background jobs.
+5. Set up Cloud Run deployment and Firebase Hosting; verify Firestore access and auth token flow.
