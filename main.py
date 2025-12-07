@@ -2130,8 +2130,13 @@ async def get_gcs_flow_files(flow_id: str):
 
         if gcs_result.get('success'):
             def _identifiers(file_data: Dict[str, Any]) -> List[str]:
-                # Prioritize stable identifiers to avoid accidentally collapsing different
-                # documents that share the same filename (e.g., original upload vs organized output).
+                """Generate identifiers that distinguish unique uploads without collapsing same-name files.
+
+                We intentionally do **not** include filename as a dedupe key because multiple uploads
+                can legitimately share the same filename but have different storage keys or document IDs.
+                Using filename would incorrectly skip backfilling missing uploads when only one of the
+                duplicates made it into Firestore.
+                """
                 ids: List[str] = []
                 doc_id = file_data.get('document_id') or file_data.get('id')
                 if doc_id:
@@ -2139,9 +2144,11 @@ async def get_gcs_flow_files(flow_id: str):
                 s3_key = file_data.get('s3_key') or file_data.get('gcs_path')
                 if s3_key:
                     ids.append(f"key:{s3_key}")
-                filename = file_data.get('filename')
-                if filename:
-                    ids.append(f"file:{filename}")
+                # Only fall back to filename if we have no stronger identifiers (rare, but avoid None)
+                if not ids:
+                    filename = file_data.get('filename')
+                    if filename:
+                        ids.append(f"file:{filename}")
                 return ids
 
             existing_keys = set()
@@ -2151,11 +2158,14 @@ async def get_gcs_flow_files(flow_id: str):
             # Process GCS temp files (original uploads) that aren't already represented
             for file in gcs_result.get('temp_files', []):
                 key = file.get('key', '')
-                filename = key.split('/')[-1]
-                identifiers = [f"key:{key}", f"file:{filename}"] if key or filename else []
+                identifiers = [f"key:{key}"] if key else []
+                if not identifiers:
+                    filename = key.split('/')[-1] if key else ''
+                    if filename:
+                        identifiers.append(f"file:{filename}")
                 if not any(identifier in existing_keys for identifier in identifiers):
                     temp_files.append({
-                        'filename': filename,
+                        'filename': key.split('/')[-1] if key else '',
                         's3_key': key,
                         'size': file.get('size', 0),
                         'uploaded_at': file.get('last_modified', ''),
@@ -2168,12 +2178,15 @@ async def get_gcs_flow_files(flow_id: str):
             # Process GCS organized files that might be missing from Firestore
             for file in gcs_result.get('organized_files', []):
                 key = file.get('key', '')
-                filename = key.split('/')[-1]
-                identifiers = [f"key:{key}", f"file:{filename}"] if key or filename else []
+                identifiers = [f"key:{key}"] if key else []
+                if not identifiers:
+                    filename = key.split('/')[-1] if key else ''
+                    if filename:
+                        identifiers.append(f"file:{filename}")
                 if not any(identifier in existing_keys for identifier in identifiers):
                     path_parts = parse_organized_path(key)
                     organized_files.append({
-                        'filename': path_parts.get('filename', filename),
+                        'filename': path_parts.get('filename', key.split('/')[-1] if key else ''),
                         's3_key': key,
                         'organized_path': '/'.join(key.split('/')[:-1]) if '/' in key else '',
                         'category': path_parts.get('category', ''),
@@ -2190,11 +2203,14 @@ async def get_gcs_flow_files(flow_id: str):
             # Process GCS failed files that might be missing from Firestore
             for file in gcs_result.get('failed_files', []):
                 key = file.get('key', '')
-                filename = key.split('/')[-1]
-                identifiers = [f"key:{key}", f"file:{filename}"] if key or filename else []
+                identifiers = [f"key:{key}"] if key else []
+                if not identifiers:
+                    filename = key.split('/')[-1] if key else ''
+                    if filename:
+                        identifiers.append(f"file:{filename}")
                 if not any(identifier in existing_keys for identifier in identifiers):
                     failed_files.append({
-                        'filename': filename,
+                        'filename': key.split('/')[-1] if key else '',
                         's3_key': key,
                         'size': file.get('size', 0),
                         'uploaded_at': file.get('last_modified', ''),
