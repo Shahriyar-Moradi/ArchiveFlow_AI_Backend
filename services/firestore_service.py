@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from google.cloud import firestore
-from google.cloud.firestore import Query, FieldFilter
+from google.cloud.firestore import Query, FieldFilter, FieldPath
 
 import sys
 from pathlib import Path
@@ -35,7 +35,7 @@ def _get_query_count(query: Query) -> int:
 
 class FirestoreService:
     """Service for interacting with Firestore database"""
-    
+
     def __init__(self):
         """Initialize Firestore client"""
         try:
@@ -52,6 +52,37 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to initialize Firestore client: {e}")
             raise
+
+    @staticmethod
+    def _fetch_documents_by_ids(collection, ids: set[str]) -> List[Dict[str, Any]]:
+        """Fetch documents by IDs in efficient chunks using document_id IN queries.
+
+        Rationale:
+        - Calling `.document(id).get()` per record makes agent/client/property list
+          endpoints slow because each fetch is a separate network round trip.
+        - Firestore limits `IN` filters to 10 elements, so we batch IDs into chunks
+          to stay within limits while keeping requests to the absolute minimum.
+
+        Use this helper whenever you need to hydrate related entities (e.g.,
+        properties from a batch of deals) instead of looping over individual gets.
+        """
+
+        documents: List[Dict[str, Any]] = []
+        if not ids:
+            return documents
+
+        id_list = list(ids)
+        chunk_size = 10
+        for i in range(0, len(id_list), chunk_size):
+            chunk_ids = id_list[i : i + chunk_size]
+            doc_refs = [collection.document(doc_id) for doc_id in chunk_ids]
+            query = collection.where(filter=FieldFilter(FieldPath.document_id(), "in", doc_refs))
+            for doc in query.stream():
+                data = doc.to_dict()
+                data["id"] = doc.id
+                documents.append(data)
+
+        return documents
     
     # Document Operations
     
@@ -327,20 +358,20 @@ class FirestoreService:
         try:
             doc_ref = self.jobs_collection.document(job_id)
             update_data = {'updated_at': firestore.SERVER_TIMESTAMP}
-            
-            if processed > 0:
-                doc = doc_ref.get()
-                if doc.exists:
-                    current_data = doc.to_dict()
-                    current_processed = current_data.get('processed_documents', 0)
-                    update_data['processed_documents'] = current_processed + processed
-            
-            if failed > 0:
-                doc = doc_ref.get()
-                if doc.exists:
-                    current_data = doc.to_dict()
-                    current_failed = current_data.get('failed_documents', 0)
-                    update_data['failed_documents'] = current_failed + failed
+
+            doc_snapshot = None
+            if processed > 0 or failed > 0:
+                doc_snapshot = doc_ref.get()
+
+            if processed > 0 and doc_snapshot and doc_snapshot.exists:
+                current_data = doc_snapshot.to_dict()
+                current_processed = current_data.get('processed_documents', 0)
+                update_data['processed_documents'] = current_processed + processed
+
+            if failed > 0 and doc_snapshot and doc_snapshot.exists:
+                current_data = doc_snapshot.to_dict()
+                current_failed = current_data.get('failed_documents', 0)
+                update_data['failed_documents'] = current_failed + failed
             
             if status:
                 update_data['status'] = status
@@ -1024,25 +1055,29 @@ class FirestoreService:
     ) -> tuple[List[Dict[str, Any]], int]:
         """List property files with filters and pagination"""
         try:
-            query = self.property_files_collection
-            
+            base_query = self.property_files_collection
+
             # Apply filters
             if client_id:
-                query = query.where(filter=FieldFilter('client_id', '==', client_id))
+                base_query = base_query.where(filter=FieldFilter('client_id', '==', client_id))
             if property_id:
-                query = query.where(filter=FieldFilter('property_id', '==', property_id))
+                base_query = base_query.where(filter=FieldFilter('property_id', '==', property_id))
             if deal_id:
-                query = query.where(filter=FieldFilter('dealId', '==', deal_id))
+                base_query = base_query.where(filter=FieldFilter('dealId', '==', deal_id))
             if status:
                 # Normalize status to uppercase to ensure case-insensitive matching
                 status_normalized = status.upper() if isinstance(status, str) else status
                 logger.info(f"Filtering property files by status: {status_normalized}")
-                query = query.where(filter=FieldFilter('status', '==', status_normalized))
+                base_query = base_query.where(filter=FieldFilter('status', '==', status_normalized))
             if transaction_type:
-                query = query.where(filter=FieldFilter('transaction_type', '==', transaction_type))
-            
-            query = query.order_by('created_at', direction=Query.DESCENDING)
-            
+                base_query = base_query.where(filter=FieldFilter('transaction_type', '==', transaction_type))
+
+            base_query = base_query.order_by('created_at', direction=Query.DESCENDING)
+
+            total = _get_query_count(base_query)
+
+            query = base_query
+
             if cursor_doc_id:
                 cursor_doc = self.property_files_collection.document(cursor_doc_id).get()
                 if cursor_doc.exists:
@@ -1052,35 +1087,35 @@ class FirestoreService:
                 query = query.offset(offset)
             
             docs = list(query.limit(page_size).stream())
+
+            property_ids = {doc.to_dict().get('property_id') for doc in docs if doc.to_dict().get('property_id')}
+            properties_map = {
+                prop['id']: prop
+                for prop in self._fetch_documents_by_ids(self.properties_collection, property_ids)
+            }
+
             property_files = []
             for doc in docs:
                 data = doc.to_dict()
                 data['id'] = doc.id
-                
+
                 # Log status for debugging
                 if status:
                     logger.debug(f"Property file {data['id']} has status: {data.get('status')}")
-                
+
                 # Enrich with property name/title if property_id exists
                 property_id = data.get('property_id')
-                if property_id:
-                    try:
-                        property_obj = self.get_property(property_id)
-                        if property_obj:
-                            # Prefer title, then name, then reference
-                            data['property_name'] = property_obj.get('title') or property_obj.get('name') or property_obj.get('reference') or data.get('property_reference')
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch property {property_id} for property file: {e}")
-                        # Fallback to property_reference if property fetch fails
-                        data['property_name'] = data.get('property_reference')
+                property_obj = properties_map.get(property_id) if property_id else None
+                if property_obj:
+                    # Prefer title, then name, then reference
+                    data['property_name'] = property_obj.get('title') or property_obj.get('name') or property_obj.get('reference') or data.get('property_reference')
                 else:
-                    # No property_id, use property_reference as fallback
+                    # No property_id or failed fetch, use property_reference as fallback
                     data['property_name'] = data.get('property_reference')
-                
+
                 property_files.append(data)
-            
+
             logger.info(f"Returning {len(property_files)} property files (filtered by status: {status})")
-            total = -1
             return property_files, total
         except Exception as e:
             logger.error(f"Failed to list property files: {e}")
@@ -1115,31 +1150,28 @@ class FirestoreService:
             query = self.property_files_collection.where(
                 filter=FieldFilter('client_id', '==', client_id)
             ).order_by('created_at', direction=Query.DESCENDING)
-            
+
             docs = list(query.stream())
+
+            property_ids = {doc.to_dict().get('property_id') for doc in docs if doc.to_dict().get('property_id')}
+            properties_map = {
+                prop['id']: prop
+                for prop in self._fetch_documents_by_ids(self.properties_collection, property_ids)
+            }
+
             property_files = []
             for doc in docs:
                 data = doc.to_dict()
                 data['id'] = doc.id
-                
-                # Enrich with property name/title if property_id exists
-                property_id = data.get('property_id')
-                if property_id:
-                    try:
-                        property_obj = self.get_property(property_id)
-                        if property_obj:
-                            # Prefer title, then name, then reference
-                            data['property_name'] = property_obj.get('title') or property_obj.get('name') or property_obj.get('reference') or data.get('property_reference')
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch property {property_id} for property file: {e}")
-                        # Fallback to property_reference if property fetch fails
-                        data['property_name'] = data.get('property_reference')
+
+                property_obj = properties_map.get(data.get('property_id'))
+                if property_obj:
+                    data['property_name'] = property_obj.get('title') or property_obj.get('name') or property_obj.get('reference') or data.get('property_reference')
                 else:
-                    # No property_id, use property_reference as fallback
                     data['property_name'] = data.get('property_reference')
-                
+
                 property_files.append(data)
-            
+
             return property_files
         except Exception as e:
             logger.error(f"Failed to get property files by client: {e}")
@@ -1350,22 +1382,14 @@ class FirestoreService:
             if use_deals:
                 # Use deals collection to find properties with active deals for this agent
                 deals = self.get_deals_by_agent(agent_id)
-                property_ids = set()
-                for deal in deals:
-                    property_id = deal.get('propertyId')
-                    if property_id:
-                        property_ids.add(property_id)
-                
+                property_ids = {deal.get('propertyId') for deal in deals if deal.get('propertyId')}
+
                 if not property_ids:
                     return [], 0
-                
-                # Fetch properties by IDs
-                properties = []
-                for property_id in property_ids:
-                    prop = self.get_property(property_id)
-                    if prop:
-                        properties.append(prop)
-                
+
+                # Fetch properties by IDs using chunked IN queries
+                properties = self._fetch_documents_by_ids(self.properties_collection, property_ids)
+
                 # Sort by created_at descending
                 properties.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
                 
@@ -1417,24 +1441,16 @@ class FirestoreService:
         try:
             # Use deals collection for efficient querying
             deals = self.get_deals_by_agent(agent_id)
-            
+
             # Extract unique client IDs from deals
-            client_ids = set()
-            for deal in deals:
-                client_id = deal.get('clientId')
-                if client_id:
-                    client_ids.add(client_id)
-            
+            client_ids = {deal.get('clientId') for deal in deals if deal.get('clientId')}
+
             if not client_ids:
                 return [], 0
-            
-            # Get clients by IDs
-            clients = []
-            for client_id in client_ids:
-                client = self.get_client(client_id)
-                if client:
-                    clients.append(client)
-            
+
+            # Get clients by IDs using chunked IN queries
+            clients = self._fetch_documents_by_ids(self.clients_collection, client_ids)
+
             # Sort by created_at descending
             clients.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
             
