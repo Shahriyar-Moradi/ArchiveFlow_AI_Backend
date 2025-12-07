@@ -1916,6 +1916,10 @@ async def delete_gcs_flow(flow_id: str, delete_temp_files: bool = False):
 async def get_gcs_flow_files(flow_id: str):
     """Get all files for a specific flow from Firestore (primary) with GCS fallback. Optimized for performance."""
     try:
+        # Normalize the flow_id early so GCS prefixes and Firestore lookups align even if the
+        # frontend included accidental whitespace.
+        flow_id = (flow_id or "").strip()
+
         # Cleanup old cache entries periodically
         _cleanup_cache(_flow_files_cache, _FLOW_FILES_CACHE_TTL)
         
@@ -2121,30 +2125,72 @@ async def get_gcs_flow_files(flow_id: str):
             else:
                 pending_files.append(file_data)
         
-        # FALLBACK: Query GCS if Firestore has no documents (lazy migration scenario)
-        if not firestore_documents:
-            logger.warning(f"⚠️  No Firestore documents found for flow {flow_id}, falling back to GCS listing")
+        # Always query GCS to reconcile any uploads that never made it into Firestore
+        try:
             gcs_result = s3_service.get_flow_files_from_s3(flow_id)
-            
-            if gcs_result.get('success'):
-                # Process GCS temp files
-                for file in gcs_result.get('temp_files', []):
+        except Exception as gcs_error:
+            logger.warning(f"⚠️  Failed to list flow files from GCS for reconciliation: {gcs_error}")
+            gcs_result = {"success": False, "error": str(gcs_error)}
+
+        if gcs_result.get('success'):
+            def _identifiers(file_data: Dict[str, Any]) -> List[str]:
+                """Generate identifiers that distinguish unique uploads without collapsing same-name files.
+
+                We intentionally do **not** include filename as a dedupe key because multiple uploads
+                can legitimately share the same filename but have different storage keys or document IDs.
+                Using filename would incorrectly skip backfilling missing uploads when only one of the
+                duplicates made it into Firestore.
+                """
+                ids: List[str] = []
+                doc_id = file_data.get('document_id') or file_data.get('id')
+                if doc_id:
+                    ids.append(f"doc:{doc_id}")
+                s3_key = file_data.get('s3_key') or file_data.get('gcs_path')
+                if s3_key:
+                    ids.append(f"key:{s3_key}")
+                # Only fall back to filename if we have no stronger identifiers (rare, but avoid None)
+                if not ids:
+                    filename = file_data.get('filename')
+                    if filename:
+                        ids.append(f"file:{filename}")
+                return ids
+
+            existing_keys = set()
+            for file_data in (temp_files + organized_files + failed_files + pending_files + need_review_files):
+                existing_keys.update(_identifiers(file_data))
+
+            # Process GCS temp files (original uploads) that aren't already represented
+            for file in gcs_result.get('temp_files', []):
+                key = file.get('key', '')
+                identifiers = [f"key:{key}"] if key else []
+                if not identifiers:
+                    filename = key.split('/')[-1] if key else ''
+                    if filename:
+                        identifiers.append(f"file:{filename}")
+                if not any(identifier in existing_keys for identifier in identifiers):
                     temp_files.append({
-                        'filename': file.get('key', '').split('/')[-1],
-                        's3_key': file.get('key', ''),
+                        'filename': key.split('/')[-1] if key else '',
+                        's3_key': key,
                         'size': file.get('size', 0),
                         'uploaded_at': file.get('last_modified', ''),
                         'last_modified': file.get('last_modified', ''),
                         'status': 'uploaded',
                         'url': file.get('url', '')
                     })
-                
-                # Process GCS organized files
-                for file in gcs_result.get('organized_files', []):
-                    key = file.get('key', '')
+                    existing_keys.update(identifiers)
+
+            # Process GCS organized files that might be missing from Firestore
+            for file in gcs_result.get('organized_files', []):
+                key = file.get('key', '')
+                identifiers = [f"key:{key}"] if key else []
+                if not identifiers:
+                    filename = key.split('/')[-1] if key else ''
+                    if filename:
+                        identifiers.append(f"file:{filename}")
+                if not any(identifier in existing_keys for identifier in identifiers):
                     path_parts = parse_organized_path(key)
                     organized_files.append({
-                        'filename': path_parts.get('filename', key.split('/')[-1]),
+                        'filename': path_parts.get('filename', key.split('/')[-1] if key else ''),
                         's3_key': key,
                         'organized_path': '/'.join(key.split('/')[:-1]) if '/' in key else '',
                         'category': path_parts.get('category', ''),
@@ -2156,25 +2202,34 @@ async def get_gcs_flow_files(flow_id: str):
                         'status': 'processed',
                         'url': file.get('url', '')
                     })
-                
-                # Process GCS failed files
-                for file in gcs_result.get('failed_files', []):
+                    existing_keys.update(identifiers)
+
+            # Process GCS failed files that might be missing from Firestore
+            for file in gcs_result.get('failed_files', []):
+                key = file.get('key', '')
+                identifiers = [f"key:{key}"] if key else []
+                if not identifiers:
+                    filename = key.split('/')[-1] if key else ''
+                    if filename:
+                        identifiers.append(f"file:{filename}")
+                if not any(identifier in existing_keys for identifier in identifiers):
                     failed_files.append({
-                        'filename': file.get('key', '').split('/')[-1],
-                        's3_key': file.get('key', ''),
+                        'filename': key.split('/')[-1] if key else '',
+                        's3_key': key,
                         'size': file.get('size', 0),
                         'uploaded_at': file.get('last_modified', ''),
                         'status': 'failed',
                         'url': file.get('url', '')
                     })
-                
-                # Try to get flow name from GCS metadata
-                if flow_name == flow_id:
-                    flow_meta = s3_service.get_flow_metadata_from_s3(flow_id)
-                    flow_name = flow_meta.get('flow', {}).get('flow_name', flow_id) if flow_meta.get('success') else flow_id
-        
-        # Calculate totals - use Firestore documents as source of truth
-        total = len(firestore_documents) or (len(temp_files) + len(organized_files) + len(failed_files) + len(pending_files) + len(need_review_files))
+                    existing_keys.update(identifiers)
+
+            # Try to get flow name from GCS metadata if Firestore didn't have it
+            if flow_name == flow_id:
+                flow_meta = s3_service.get_flow_metadata_from_s3(flow_id)
+                flow_name = flow_meta.get('flow', {}).get('flow_name', flow_id) if flow_meta.get('success') else flow_id
+
+        # Calculate totals - prefer reconciled counts when available
+        total = len(temp_files) + len(organized_files) + len(failed_files) + len(pending_files) + len(need_review_files)
         organized_count = len(organized_files)
         
         # PERFORMANCE FIX: Removed count sync from read operations
@@ -2201,13 +2256,22 @@ async def get_gcs_flow_files(flow_id: str):
             },
             'source': 'firestore' if firestore_documents else 'gcs_fallback'
         }
+
+        # Surface reconciliation errors so callers can prompt a retry instead of silently
+        # returning an empty payload when neither Firestore nor GCS returned data.
+        if not firestore_documents and not gcs_result.get('success'):
+            response_data['success'] = False
+            response_data['error'] = gcs_result.get('error', 'Unknown error while listing flow files')
         
         logger.info(f"✅ Retrieved {total} files for flow {flow_id} from {'Firestore' if firestore_documents else 'GCS'}")
         logger.info(f"   - Organized: {organized_count}, Temp: {len(temp_files)}, Pending: {len(pending_files)}, Failed: {len(failed_files)}")
         
-        # Cache the result
-        _flow_files_cache[cache_key] = (response_data, now)
-        
+        # Cache the result only when we have something to serve; if totals are zero or the
+        # data sources failed, skip caching so the next request can see newly arriving files
+        # without waiting for the TTL to expire.
+        if total > 0 or firestore_documents or gcs_result.get('success'):
+            _flow_files_cache[cache_key] = (response_data, now)
+
         return JSONResponse(content=response_data)
     
     except Exception as e:
@@ -2683,6 +2747,9 @@ async def create_document_metadata(
         if not agent_id:
             raise HTTPException(status_code=401, detail="User not authenticated")
         
+        # Normalize flow_id to avoid accidental whitespace mismatches in prefixes
+        flow_id = (flow_id or "").strip()
+
         # Ensure flow exists in Firestore
         _ensure_flow_exists(flow_id, flow_name)
         
@@ -2858,7 +2925,7 @@ async def complete_document_upload(
 
 @app.post("/api/gcs/upload-files")
 async def gcs_upload_files(
-    files: List[UploadFile] = File(...), 
+    files: List[UploadFile] = File(...),
     flow_id: Optional[str] = Form(None),
     flow_name: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -2882,8 +2949,9 @@ async def gcs_upload_files(
     except Exception as e:
         logger.debug(f"Could not extract agent ID from request: {e}")
 
-    # Ensure flow_id exists if provided; otherwise generate one
-    final_flow_id = flow_id or f"flow-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Ensure flow_id exists if provided; otherwise generate one. Strip whitespace to avoid
+    # prefix mismatches that would hide uploads when listing flow files.
+    final_flow_id = (flow_id or "").strip() or f"flow-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Ensure flow exists in Firestore before uploading documents
     # Use provided flow_name if available, otherwise it will default to "Uploaded Flow"
