@@ -4253,6 +4253,104 @@ async def get_folder_documents(folder_name: str):
         "total": len(documents)
     })
 
+# Document status endpoints - MUST be defined BEFORE the generic /api/document/{folder_name}/{document_name} route
+# to avoid route matching conflicts
+
+@app.get("/api/document/{document_id:path}/status")
+async def get_document_status(document_id: str):
+    """Get processing status of a specific document from Firestore"""
+    if not firestore_service:
+        raise HTTPException(status_code=503, detail="Firestore service not available")
+    
+    doc = firestore_service.get_document(document_id)
+    if doc:
+        return JSONResponse(content={
+            "success": True,
+            "document_id": document_id,
+            "status": doc.get('processing_status', 'unknown'),
+            "data": doc
+        })
+    else:
+        return JSONResponse(content={
+            "success": True,
+            "document_id": document_id,
+            "status": "not_processed",
+            "data": None
+        })
+
+@app.get("/api/document/{document_id:path}/processing-status")
+async def get_document_processing_status(document_id: str):
+    """Get detailed processing status for a specific document from Firestore"""
+    if not firestore_service:
+        return JSONResponse(content={
+            "success": False,
+            "document_id": document_id,
+            "message": "Firestore not available"
+        })
+    
+    try:
+        # URL decode the document_id in case it was encoded
+        from urllib.parse import unquote
+        document_id = unquote(document_id)
+        
+        logger.info(f"Getting processing status for document: {document_id}")
+        doc = firestore_service.get_document(document_id)
+        
+        if doc:
+            return JSONResponse(content={
+                "success": True,
+                "document_id": document_id,
+                "status": doc
+            })
+        else:
+            # Try to find document by searching in the flow if document_id contains flow_id
+            # Document ID format: flow-YYYYMMDD_HHMMSS_filename_randomhex
+            if '_' in document_id:
+                parts = document_id.split('_')
+                if len(parts) >= 2:
+                    # Try to extract flow_id (format: flow-YYYYMMDD_HHMMSS)
+                    potential_flow_id = '_'.join(parts[:2]) if parts[0].startswith('flow-') else None
+                    if potential_flow_id:
+                        logger.info(f"Document not found by ID, trying to search in flow: {potential_flow_id}")
+                        try:
+                            flow_docs, _ = firestore_service.get_documents_by_flow_id(
+                                potential_flow_id, page=1, page_size=100
+                            )
+                            # Try to find document by matching filename or partial ID
+                            for flow_doc in flow_docs:
+                                doc_id = flow_doc.get('document_id') or flow_doc.get('id', '')
+                                filename = flow_doc.get('filename', '')
+                                # Check if this might be the document we're looking for
+                                if (document_id in doc_id or 
+                                    doc_id in document_id or
+                                    any(part in filename for part in parts[2:] if len(parts) > 2)):
+                                    logger.info(f"Found potential match: {doc_id}")
+                                    return JSONResponse(content={
+                                        "success": True,
+                                        "document_id": doc_id,
+                                        "status": flow_doc,
+                                        "note": "Found by flow search"
+                                    })
+                        except Exception as search_error:
+                            logger.warning(f"Flow search failed: {search_error}")
+            
+            logger.warning(f"Document not found: {document_id}")
+            return JSONResponse(content={
+                "success": False,
+                "document_id": document_id,
+                "message": "Document not found in Firestore",
+                "status": "not_found"
+            })
+    except Exception as e:
+        logger.error(f"Failed to get document status: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return JSONResponse(content={
+            "success": False,
+            "document_id": document_id,
+            "error": str(e)
+        }, status_code=500)
+
 @app.get("/api/document/{folder_name}/{document_name}")
 async def get_document(folder_name: str, document_name: str):
     """Get a specific document file"""
@@ -4342,28 +4440,6 @@ async def websocket_endpoint(websocket: WebSocket):
         # Unexpected error, log it and disconnect
         logger.error(f"Unexpected error in websocket_endpoint: {type(e).__name__}: {e}", exc_info=True)
         manager.disconnect(websocket)
-
-@app.get("/api/document/{document_id:path}/status")
-async def get_document_status(document_id: str):
-    """Get processing status of a specific document from Firestore"""
-    if not firestore_service:
-        raise HTTPException(status_code=503, detail="Firestore service not available")
-    
-    doc = firestore_service.get_document(document_id)
-    if doc:
-        return JSONResponse(content={
-            "success": True,
-            "document_id": document_id,
-            "status": doc.get('processing_status', 'unknown'),
-            "data": doc
-        })
-    else:
-        return JSONResponse(content={
-            "success": True,
-            "document_id": document_id,
-            "status": "not_processed",
-            "data": None
-        })
 
 @app.get("/api/documents/processed")
 async def get_processed_documents(page: int = 1, page_size: int = 100):
@@ -4744,79 +4820,6 @@ async def get_processing_summary():
             "success_rate": (completed_docs / max(1, total_docs)) * 100 if total_docs > 0 else 0
         }
     })
-
-@app.get("/api/document/{document_id:path}/processing-status")
-async def get_document_processing_status(document_id: str):
-    """Get detailed processing status for a specific document from Firestore"""
-    if not firestore_service:
-        return JSONResponse(content={
-            "success": False,
-            "document_id": document_id,
-            "message": "Firestore not available"
-        })
-    
-    try:
-        # URL decode the document_id in case it was encoded
-        from urllib.parse import unquote
-        document_id = unquote(document_id)
-        
-        logger.info(f"Getting processing status for document: {document_id}")
-        doc = firestore_service.get_document(document_id)
-        
-        if doc:
-            return JSONResponse(content={
-                "success": True,
-                "document_id": document_id,
-                "status": doc
-            })
-        else:
-            # Try to find document by searching in the flow if document_id contains flow_id
-            # Document ID format: flow-YYYYMMDD_HHMMSS_filename_randomhex
-            if '_' in document_id:
-                parts = document_id.split('_')
-                if len(parts) >= 2:
-                    # Try to extract flow_id (format: flow-YYYYMMDD_HHMMSS)
-                    potential_flow_id = '_'.join(parts[:2]) if parts[0].startswith('flow-') else None
-                    if potential_flow_id:
-                        logger.info(f"Document not found by ID, trying to search in flow: {potential_flow_id}")
-                        try:
-                            flow_docs, _ = firestore_service.get_documents_by_flow_id(
-                                potential_flow_id, page=1, page_size=100
-                            )
-                            # Try to find document by matching filename or partial ID
-                            for flow_doc in flow_docs:
-                                doc_id = flow_doc.get('document_id') or flow_doc.get('id', '')
-                                filename = flow_doc.get('filename', '')
-                                # Check if this might be the document we're looking for
-                                if (document_id in doc_id or 
-                                    doc_id in document_id or
-                                    any(part in filename for part in parts[2:] if len(parts) > 2)):
-                                    logger.info(f"Found potential match: {doc_id}")
-                                    return JSONResponse(content={
-                                        "success": True,
-                                        "document_id": doc_id,
-                                        "status": flow_doc,
-                                        "note": "Found by flow search"
-                                    })
-                        except Exception as search_error:
-                            logger.warning(f"Flow search failed: {search_error}")
-            
-            logger.warning(f"Document not found: {document_id}")
-            return JSONResponse(content={
-                "success": False,
-                "document_id": document_id,
-                "message": "Document not found in Firestore",
-                "status": "not_found"
-            })
-    except Exception as e:
-        logger.error(f"Failed to get document status: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return JSONResponse(content={
-            "success": False,
-            "document_id": document_id,
-            "error": str(e)
-        }, status_code=500)
 
 @app.post("/api/aws/test")
 async def test_gcp_connection():
