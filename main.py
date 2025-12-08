@@ -239,14 +239,14 @@ _FLOW_FILES_CACHE_TTL = 15  # 15 seconds TTL (shorter than browse since it chang
 _clients_cache: Dict[str, tuple] = {}
 _agents_cache: Dict[str, tuple] = {}
 _property_files_cache: Dict[str, tuple] = {}
-_CLIENTS_CACHE_TTL = 30  # 30 seconds for list endpoints
-_AGENTS_CACHE_TTL = 300  # 5 minutes for list endpoints (agent stats don't change frequently)
+_CLIENTS_CACHE_TTL = 120  # 2 minutes for list endpoints (increased from 30s for better performance)
+_AGENTS_CACHE_TTL = 600  # 10 minutes for list endpoints (increased from 5 minutes - agent stats don't change frequently)
 _PROPERTY_FILES_CACHE_TTL = 30  # 30 seconds for list endpoints
 _CLIENT_DETAIL_CACHE_TTL = 60  # 60 seconds for detail endpoints
 
 # Analytics cache
 _analytics_cache: Dict[str, tuple] = {}
-_ANALYTICS_CACHE_TTL = 60  # 60 seconds for analytics endpoints
+_ANALYTICS_CACHE_TTL = 300  # 5 minutes for analytics endpoints (increased from 60s for better performance)
 
 # Cache management helper
 def _cleanup_cache(cache: Dict[str, tuple], ttl: int, max_entries: int = 100) -> None:
@@ -1499,13 +1499,122 @@ def calculate_agent_stats(agent_id: str) -> Dict[str, int]:
 
 def calculate_agent_stats_batch(agent_ids: List[str]) -> Dict[str, Dict[str, int]]:
     """
-    Calculate stats for multiple agents in batch.
+    Calculate stats for multiple agents in batch using optimized queries.
     Returns a dict mapping agent_id to stats dict.
+    This is much faster than calling calculate_agent_stats() for each agent individually.
     """
-    stats = {}
-    for agent_id in agent_ids:
-        stats[agent_id] = calculate_agent_stats(agent_id)
-    return stats
+    if not agent_ids:
+        return {}
+    
+    # Initialize stats dict with zeros for all agents
+    stats = {agent_id: {'properties_count': 0, 'clients_count': 0, 'documents_count': 0} for agent_id in agent_ids}
+    
+    try:
+        # OPTIMIZATION 1: Batch fetch all deals for all agents
+        # Firestore doesn't support whereIn for multiple agentIds efficiently, so we'll use a different approach
+        # Get all deals and group by agentId in memory (faster than N queries)
+        all_deals = []
+        try:
+            # Get all deals (we'll filter by agentId in memory)
+            # This is faster than N separate queries if there aren't too many deals
+            deals_query = firestore_service.deals_collection.limit(10000)  # Reasonable limit
+            deals_docs = list(deals_query.stream())
+            for doc in deals_docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                all_deals.append(data)
+        except Exception as e:
+            logger.warning(f"Error fetching deals for batch stats: {e}")
+            all_deals = []
+        
+        # Group deals by agentId
+        deals_by_agent = defaultdict(list)
+        client_ids_from_deals_by_agent = defaultdict(set)
+        property_ids_from_deals_by_agent = defaultdict(set)
+        
+        for deal in all_deals:
+            agent_id = deal.get('agentId')
+            if agent_id and agent_id in agent_ids:
+                deals_by_agent[agent_id].append(deal)
+                client_id = deal.get('clientId')
+                property_id = deal.get('propertyId')
+                if client_id:
+                    client_ids_from_deals_by_agent[agent_id].add(client_id)
+                if property_id:
+                    property_ids_from_deals_by_agent[agent_id].add(property_id)
+        
+        # OPTIMIZATION 2: Batch fetch all properties for all agents
+        property_ids_by_agent = defaultdict(set)
+        try:
+            # Get all properties and group by agentId
+            properties_query = firestore_service.properties_collection.limit(10000)  # Reasonable limit
+            properties_docs = list(properties_query.stream())
+            for doc in properties_docs:
+                data = doc.to_dict()
+                agent_id = data.get('agentId')
+                if agent_id and agent_id in agent_ids:
+                    property_ids_by_agent[agent_id].add(doc.id)
+        except Exception as e:
+            logger.warning(f"Error fetching properties for batch stats: {e}")
+        
+        # Combine property IDs from deals and direct properties
+        for agent_id in agent_ids:
+            property_ids = property_ids_from_deals_by_agent[agent_id].union(property_ids_by_agent[agent_id])
+            stats[agent_id]['properties_count'] = len(property_ids)
+        
+        # OPTIMIZATION 3: Batch fetch document counts using aggregation queries
+        # Use count aggregation for each agent (still faster than fetching all docs)
+        documents_count_by_agent = {}
+        client_ids_from_docs_by_agent = defaultdict(set)
+        
+        for agent_id in agent_ids:
+            try:
+                # Use count aggregation for document count (fast)
+                docs_query = firestore_service.documents_collection.where(
+                    filter=FieldFilter('agentId', '==', agent_id)
+                )
+                try:
+                    count_query = docs_query.count()
+                    count_result = count_query.get()
+                    if count_result and count_result[0] and hasattr(count_result[0][0], "value"):
+                        documents_count_by_agent[agent_id] = int(count_result[0][0].value)
+                    else:
+                        documents_count_by_agent[agent_id] = 0
+                except Exception:
+                    documents_count_by_agent[agent_id] = 0
+                
+                # Get unique client IDs from documents (only fetch clientId field for speed)
+                try:
+                    client_ids_query = docs_query.select(['clientId']).limit(5000)
+                    client_ids_docs = list(client_ids_query.stream())
+                    for doc in client_ids_docs:
+                        doc_data = doc.to_dict()
+                        client_id = doc_data.get('clientId')
+                        if client_id:
+                            client_ids_from_docs_by_agent[agent_id].add(client_id)
+                except Exception:
+                    # Fallback: skip client IDs from docs if select fails
+                    pass
+                
+            except Exception as e:
+                logger.warning(f"Error querying documents for agent {agent_id} in batch: {e}")
+                documents_count_by_agent[agent_id] = 0
+        
+        # Combine all stats
+        for agent_id in agent_ids:
+            # Documents count
+            stats[agent_id]['documents_count'] = documents_count_by_agent.get(agent_id, 0)
+            
+            # Clients count (from deals + documents)
+            client_ids = client_ids_from_deals_by_agent[agent_id].union(client_ids_from_docs_by_agent[agent_id])
+            stats[agent_id]['clients_count'] = len(client_ids)
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error calculating batch agent stats: {e}")
+        # Return zeros for all agents on error
+        return {agent_id: {'properties_count': 0, 'clients_count': 0, 'documents_count': 0} for agent_id in agent_ids}
 
 @app.get("/api/agents/batch")
 async def list_agents_batch(
@@ -7024,17 +7133,8 @@ async def list_clients_batch(
             agent_id=target_agent_id
         )
         
-        # Auto-assign agents for clients without assigned agents based on logged-in user
-        for client in clients:
-            if not client.get('agent') or not client['agent'].get('id'):
-                # Client has no agent assigned, auto-assign based on current_user
-                client_id = client.get('id')
-                if client_id:
-                    agent_id = firestore_service.auto_assign_agent_to_client(client_id, current_user)
-                    if agent_id:
-                        logger.info(f"Auto-assigned agent {agent_id} to client {client_id} during listing")
-                        # Update client in list with assigned agent
-                        client['agent'] = {'id': agent_id}
+        # PERFORMANCE OPTIMIZATION: Removed auto-assignment logic from list endpoint
+        # Auto-assignment should be done in a background job or separate endpoint to avoid blocking list requests
         
         # Enrich agent data from simple_auth
         from simple_auth import simple_auth

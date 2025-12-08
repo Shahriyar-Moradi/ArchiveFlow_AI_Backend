@@ -2187,7 +2187,7 @@ class FirestoreService:
         try:
             # Use deals collection for efficient querying
             deals = self.get_deals_by_client(client_id)
-            property_files: List[Dict[str, Any]] = []
+            property_references_only = set()  # Initialize early so it's always available
             
             # Extract unique property IDs from deals
             property_ids = set()
@@ -2196,61 +2196,65 @@ class FirestoreService:
                 if property_id:
                     property_ids.add(property_id)
             
-            if not property_ids:
-                # Fallback to property files if no deals found
-                property_files = self.get_property_files_by_client(client_id)
-                logger.info(f"Found {len(property_files)} property files by client_id for client {client_id}")
-                
-                # If no property files found by client_id, try searching by client_full_name as fallback
-                if not property_files:
-                    client = self.get_client(client_id)
-                    if client and client.get('full_name'):
-                        # Search property files by client_full_name
-                        try:
-                            query = self.property_files_collection.where(
-                                filter=FieldFilter('client_full_name', '==', client.get('full_name'))
-                            ).order_by('created_at', direction=Query.DESCENDING)
-                            docs = list(query.stream())
-                            property_files = []
-                            for doc in docs:
-                                data = doc.to_dict()
-                                data['id'] = doc.id
-                                # Normalize and persist missing links
-                                property_files.append(self._normalize_property_file_links(data, expected_client_id=client_id))
-                            
-                            # Fix data consistency: update property files with correct client_id
-                            for pf in property_files:
-                                pf_client_id = pf.get('client_id')
-                                if pf_client_id != client_id:
-                                    # Update property file to have correct client_id
-                                    pf_id = pf.get('id')
-                                    if pf_id:
-                                        self.update_property_file_client_id(pf_id, client_id)
-                                        # Update the in-memory data for immediate use
-                                        pf['client_id'] = client_id
-                                        logger.info(f"Fixed property file {pf_id}: updated client_id from {pf_client_id} to {client_id}")
-                            
-                            logger.info(f"Found {len(property_files)} property files by client_full_name '{client.get('full_name')}' for client {client_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to search property files by client_full_name: {e}")
-                
-                if not property_files:
-                    logger.info(f"No property files found for client {client_id}")
-                    return []
-                
-                # Extract property IDs from property files
-                for pf in property_files:
-                    prop_id = pf.get('property_id') or pf.get('propertyId')
-                    if prop_id:
-                        property_ids.add(prop_id)
+            # Always fetch property files as fallback (even if we have property_ids from deals)
+            # This ensures we can find properties linked only through property files
+            property_files = self.get_property_files_by_client(client_id)
+            logger.info(f"Found {len(property_files)} property files by client_id for client {client_id}")
             
-            if not property_ids:
+            # If no property files found by client_id, try searching by client_full_name as fallback
+            if not property_files:
+                client = self.get_client(client_id)
+                if client and client.get('full_name'):
+                    # Search property files by client_full_name
+                    try:
+                        query = self.property_files_collection.where(
+                            filter=FieldFilter('client_full_name', '==', client.get('full_name'))
+                        ).order_by('created_at', direction=Query.DESCENDING)
+                        docs = list(query.stream())
+                        property_files = []
+                        for doc in docs:
+                            data = doc.to_dict()
+                            data['id'] = doc.id
+                            # Normalize and persist missing links
+                            property_files.append(self._normalize_property_file_links(data, expected_client_id=client_id))
+                        
+                        # Fix data consistency: update property files with correct client_id
+                        for pf in property_files:
+                            pf_client_id = pf.get('client_id')
+                            if pf_client_id != client_id:
+                                # Update property file to have correct client_id
+                                pf_id = pf.get('id')
+                                if pf_id:
+                                    self.update_property_file_client_id(pf_id, client_id)
+                                    # Update the in-memory data for immediate use
+                                    pf['client_id'] = client_id
+                                    logger.info(f"Fixed property file {pf_id}: updated client_id from {pf_client_id} to {client_id}")
+                        
+                        logger.info(f"Found {len(property_files)} property files by client_full_name '{client.get('full_name')}' for client {client_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to search property files by client_full_name: {e}")
+            
+            # Extract property IDs and references from property files
+            # Collect references early so we can search by reference even if no property_ids
+            for pf in property_files:
+                prop_id = pf.get('property_id') or pf.get('propertyId')
+                property_reference = pf.get('property_reference')
+                
+                if prop_id:
+                    property_ids.add(prop_id)
+                elif property_reference:
+                    # Collect references even if no property_id
+                    property_references_only.add(property_reference)
+            
+            # Only return early if we have neither property_ids nor references to search
+            if not property_ids and not property_references_only:
                 return []
             
             # Track property files with their IDs and references for fallback lookup
             property_file_lookups = []  # List of (property_id, property_reference) tuples
-            property_references_only = set()  # References from files without property_id
             
+            # Re-iterate property files to build property_file_lookups for ones with property_id
+            # (property_references_only already collected above)
             for pf in property_files:
                 property_id = pf.get('property_id') or pf.get('propertyId')
                 property_reference = pf.get('property_reference')
@@ -2258,8 +2262,8 @@ class FirestoreService:
                 if property_id:
                     # Store both ID and reference for fallback
                     property_file_lookups.append((property_id, property_reference))
-                elif property_reference:
-                    # Only reference available
+                elif property_reference and property_reference not in property_references_only:
+                    # Add to property_references_only if not already collected
                     property_references_only.add(property_reference)
             
             # Fetch properties by ID first
@@ -2531,53 +2535,9 @@ class FirestoreService:
                                 else:
                                     logger.warning(f"Error fetching property files batch on {field_name}: {e}")
                     
-                    # Fix data consistency: Check for clients with no property files found
-                    # and try to find property files by client_full_name as fallback
-                    clients_without_property_files = [cid for cid in client_ids if cid not in property_files_by_client]
-                    if clients_without_property_files:
-                        # For clients without property files, check if there are property files
-                        # with matching client_full_name but wrong client_id
-                        for client_id in clients_without_property_files:
-                            client = next((c for c in clients if c['id'] == client_id), None)
-                            if client and client.get('full_name'):
-                                try:
-                                    # Search property files by client_full_name (without order_by to avoid index requirement)
-                                    query = self.property_files_collection.where(
-                                        filter=FieldFilter('client_full_name', '==', client.get('full_name'))
-                                    ).limit(10)  # Limit to avoid too many results
-                                    docs = list(query.stream())
-                                    
-                                    for doc in docs:
-                                        pf_data = doc.to_dict()
-                                        pf_data['id'] = doc.id
-                                        pf_data = self._normalize_property_file_links(pf_data, expected_client_id=client_id)
-                                        pf_client_id = pf_data.get('client_id')
-                                        
-                                        if pf_data.get('id') in seen_property_file_ids:
-                                            continue
-                                        
-                                        # If this property file has wrong or missing client_id, fix it
-                                        if pf_client_id != client_id:
-                                            pf_id = pf_data.get('id')
-                                            if pf_id:
-                                                self.update_property_file_client_id(pf_id, client_id)
-                                                logger.info(f"Fixed property file {pf_id} in batch: updated client_id from {pf_client_id} to {client_id}")
-                                                # Update the in-memory data
-                                                pf_data['client_id'] = client_id
-                                        
-                                        # Add to property_files_by_client for this client
-                                        if client_id not in property_files_by_client:
-                                            property_files_by_client[client_id] = []
-                                        property_files_by_client[client_id].append(pf_data)
-                                        if pf_data.get('id'):
-                                            seen_property_file_ids.add(pf_data['id'])
-                                except Exception as e:
-                                    # Handle index errors gracefully - log as warning, not error
-                                    error_str = str(e).lower()
-                                    if 'index' in error_str or '400' in error_str:
-                                        logger.warning(f"Index not available for property_files query by client_full_name (non-fatal): {e}")
-                                    else:
-                                        logger.warning(f"Error checking property files by name for client {client_id}: {e}")
+                    # PERFORMANCE OPTIMIZATION: Removed fallback queries by client_full_name
+                    # These queries were slow and should be handled in a background data consistency job
+                    # Clients without property files will simply have empty property_files arrays
             except Exception as e:
                 # Handle index errors gracefully - log as warning, not error
                 error_str = str(e).lower()
@@ -2591,6 +2551,9 @@ class FirestoreService:
             all_property_ids = set()
             property_id_to_client_map = {}  # Track which properties belong to which clients
             
+            # Also collect property_references from property files without property_id
+            property_references_to_search = {}  # Map: reference -> list of (client_id, property_file) tuples
+            
             for client_id in client_ids:
                 if client_id in property_files_by_client:
                     for pf in property_files_by_client[client_id]:
@@ -2601,6 +2564,13 @@ class FirestoreService:
                                 property_id_to_client_map[property_id] = []
                             if client_id not in property_id_to_client_map[property_id]:
                                 property_id_to_client_map[property_id].append(client_id)
+                        else:
+                            # No property_id, but check if we have property_reference
+                            property_reference = pf.get('property_reference')
+                            if property_reference:
+                                if property_reference not in property_references_to_search:
+                                    property_references_to_search[property_reference] = []
+                                property_references_to_search[property_reference].append((client_id, pf))
             
             # Batch fetch all properties at once
             properties_map = {}
@@ -2609,7 +2579,7 @@ class FirestoreService:
                 for prop in properties_list:
                     properties_map[prop['id']] = prop
             
-            # Group properties by client_id
+            # Group properties by client_id (from property_id)
             client_properties_map = {}
             for property_id, client_ids_for_prop in property_id_to_client_map.items():
                 if property_id in properties_map:
@@ -2617,21 +2587,94 @@ class FirestoreService:
                     for client_id in client_ids_for_prop:
                         if client_id not in client_properties_map:
                             client_properties_map[client_id] = []
-                        client_properties_map[client_id].append(prop_data)
+                        # Avoid duplicates
+                        if prop_data['id'] not in [p['id'] for p in client_properties_map[client_id]]:
+                            client_properties_map[client_id].append(prop_data)
             
-            # Get all documents to batch-process agent relationships
+            # Search properties by reference for property files without property_id
+            if property_references_to_search:
+                for property_reference, client_pf_pairs in property_references_to_search.items():
+                    try:
+                        matching_properties = self.search_properties_by_reference(property_reference)
+                        if matching_properties:
+                            # Normalize the search reference for comparison
+                            search_ref_normalized = property_reference.lower().strip()
+                            
+                            # Find the best matching property
+                            best_match = None
+                            for prop in matching_properties:
+                                prop_ref = prop.get('reference', '').strip()
+                                prop_ref_normalized = prop_ref.lower()
+                                
+                                # Prefer exact match
+                                if prop_ref_normalized == search_ref_normalized:
+                                    best_match = prop
+                                    break
+                            
+                            # If no exact match, use the first close match
+                            if not best_match:
+                                for prop in matching_properties:
+                                    prop_ref = prop.get('reference', '').strip()
+                                    prop_ref_normalized = prop_ref.lower()
+                                    
+                                    # Check for close match (reference contains search term or vice versa)
+                                    if search_ref_normalized in prop_ref_normalized or \
+                                       prop_ref_normalized in search_ref_normalized:
+                                        best_match = prop
+                                        break
+                            
+                            # If we found a match, link it to all clients that have property files with this reference
+                            if best_match:
+                                prop_id = best_match['id']
+                                # Add to properties_map if not already there
+                                if prop_id not in properties_map:
+                                    properties_map[prop_id] = best_match
+                                
+                                # Link to all relevant clients
+                                for client_id, pf in client_pf_pairs:
+                                    if client_id not in client_properties_map:
+                                        client_properties_map[client_id] = []
+                                    # Avoid duplicates
+                                    if prop_id not in [p['id'] for p in client_properties_map[client_id]]:
+                                        client_properties_map[client_id].append(best_match)
+                                        logger.info(f"Linked property {prop_id} (reference: {property_reference}) to client {client_id} via property file reference")
+                    except Exception as e:
+                        # Handle errors gracefully - log but don't fail the entire request
+                        logger.warning(f"Error searching properties by reference '{property_reference}': {e}")
+                        continue
+            
+            # PERFORMANCE OPTIMIZATION: Batch fetch documents for all clients using chunked IN queries
+            # This is much faster than N separate queries (one per client)
             all_docs = []
             if client_ids:
-                # Query documents for all clients
-                for client_id in client_ids:
+                # Chunk client_ids into batches of 10 (Firestore IN limit)
+                chunk_size = 10
+                for i in range(0, len(client_ids), chunk_size):
+                    chunk_client_ids = client_ids[i : i + chunk_size]
                     try:
-                        client_docs_query = self.documents_collection.where(
-                            filter=FieldFilter('clientId', '==', client_id)
-                        )
-                        client_docs = list(client_docs_query.stream())
-                        all_docs.extend([(client_id, doc) for doc in client_docs])
+                        # Use IN query to fetch documents for multiple clients at once
+                        docs_query = self.documents_collection.where(
+                            filter=FieldFilter('clientId', 'in', chunk_client_ids)
+                        ).limit(1000)  # Limit to avoid too many results
+                        chunk_docs = list(docs_query.stream())
+                        # Group by client_id
+                        for doc in chunk_docs:
+                            doc_data = doc.to_dict()
+                            doc_client_id = doc_data.get('clientId')
+                            if doc_client_id and doc_client_id in chunk_client_ids:
+                                all_docs.append((doc_client_id, doc))
                     except Exception as e:
-                        logger.warning(f"Error fetching documents for client {client_id}: {e}")
+                        logger.warning(f"Error batch fetching documents for clients chunk: {e}")
+                        # Fallback: try individual queries for this chunk if batch fails
+                        for client_id in chunk_client_ids:
+                            try:
+                                client_docs_query = self.documents_collection.where(
+                                    filter=FieldFilter('clientId', '==', client_id)
+                                ).limit(100)  # Smaller limit for fallback
+                                client_docs = list(client_docs_query.stream())
+                                all_docs.extend([(client_id, doc) for doc in client_docs])
+                            except Exception as fallback_error:
+                                logger.warning(f"Error fetching documents for client {client_id}: {fallback_error}")
             
             # Process agent relationships for all clients
             client_agent_map = {}
@@ -2691,6 +2734,7 @@ class FirestoreService:
             # Get property files
             property_files = self.get_property_files_by_client(client_id)
             client['property_files'] = property_files
+            client['property_file_count'] = len(property_files)
             
             return client
         except Exception as e:

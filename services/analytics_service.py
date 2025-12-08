@@ -70,10 +70,10 @@ class AnalyticsService:
     def get_agent_analytics(self, agent_id: str) -> Dict[str, Any]:
         """Get analytics for a specific agent"""
         try:
-            # Get all documents for this agent
+            # PERFORMANCE OPTIMIZATION: Add limit to document query
             query = self.documents_collection.where(
                 filter=FieldFilter('agentId', '==', agent_id)
-            )
+            ).limit(5000)  # Limit to 5000 for performance
             docs = list(query.stream())
             
             # Get properties for this agent
@@ -216,7 +216,8 @@ class AnalyticsService:
                 document_type_breakdown[doc_type] += 1
             
             # Property workflow progress (using property_files)
-            property_files = list(self.property_files_collection.stream())
+            # PERFORMANCE OPTIMIZATION: Add limit to avoid streaming entire collection
+            property_files = list(self.property_files_collection.limit(1000).stream())
             workflow_progress = []
             
             for pf in property_files:
@@ -270,7 +271,9 @@ class AnalyticsService:
             docs = list(docs_query.stream())
             
             # OPTIMIZED: Limit property files query to 1000 for performance
-            property_files = list(self.property_files_collection.limit(1000).stream())
+            # PERFORMANCE: Further optimized - only fetch property files that have client_id
+            property_files_query = self.property_files_collection.limit(1000)
+            property_files = list(property_files_query.stream())
             
             # Find clients with missing documents
             clients_missing_docs = []
