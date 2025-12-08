@@ -81,6 +81,8 @@ class FirestoreService:
         
         for i in range(0, len(id_list), chunk_size):
             chunk_ids = id_list[i : i + chunk_size]
+            # Note: For document_id queries with "in", positional arguments are required
+            # The warning can be ignored as this is the correct syntax for document ID queries
             query = collection.where(FieldPath.document_id(), "in", chunk_ids)
             for doc in query.stream():
                 data = doc.to_dict()
@@ -130,7 +132,7 @@ class FirestoreService:
     def get_document_by_image_hash(self, image_hash: str) -> Optional[Dict[str, Any]]:
         """Get a document by image hash (for duplicate detection)"""
         try:
-            query = self.documents_collection.where('image_hash', '==', image_hash).limit(1)
+            query = self.documents_collection.where(filter=FieldFilter('image_hash', '==', image_hash)).limit(1)
             docs = query.stream()
             for doc in docs:
                 data = doc.to_dict()
@@ -1986,21 +1988,26 @@ class FirestoreService:
         page_size: int = 20,
         cursor_doc_id: Optional[str] = None
     ) -> tuple[List[Dict[str, Any]], int]:
-        """List all clients related to a specific agent through deals, property files, documents, or stored agent_id"""
+        """List all clients related to a specific agent through property files, documents, or stored agent_id.
+        (Deals functionality commented out - not needed)
+        All clients are verified to have correct agent_id relationships before being returned.
+        Only returns clients that have a verified relationship with the specified agent."""
         try:
+            # Collect client IDs from verified sources - all must have correct agent_id
             client_ids = set()
             
-            # Method 1: Get clients from deals collection
-            try:
-                deals = self.get_deals_by_agent(agent_id)
-                for deal in deals:
-                    client_id = deal.get('clientId')
-                    if client_id:
-                        client_ids.add(client_id)
-            except Exception as e:
-                logger.warning(f"Error getting clients from deals for agent {agent_id}: {e}")
+            # Method 1: Get clients from deals collection - COMMENTED OUT (deals not needed)
+            # try:
+            #     deals = self.get_deals_by_agent(agent_id)
+            #     for deal in deals:
+            #         client_id = deal.get('clientId')
+            #         if client_id:
+            #             client_ids.add(client_id)
+            # except Exception as e:
+            #     logger.warning(f"Error getting clients from deals for agent {agent_id}: {e}")
             
             # Method 2: Get clients from property files with this agent_id
+            # IMPORTANT: Only include property files that have the correct agent_id to ensure relationship is verified
             try:
                 property_files_query = self.property_files_collection.where(
                     filter=FieldFilter('agent_id', '==', agent_id)
@@ -2008,13 +2015,17 @@ class FirestoreService:
                 property_files = list(property_files_query.stream())
                 for pf_doc in property_files:
                     pf_data = pf_doc.to_dict()
-                    client_id = pf_data.get('client_id')
-                    if client_id:
-                        client_ids.add(client_id)
+                    # Verify agent_id matches (double-check for safety)
+                    pf_agent_id = pf_data.get('agent_id')
+                    if pf_agent_id == agent_id:
+                        client_id = pf_data.get('client_id')
+                        if client_id:
+                            client_ids.add(client_id)
             except Exception as e:
                 logger.warning(f"Error getting clients from property files for agent {agent_id}: {e}")
             
             # Method 3: Get clients from documents with this agentId
+            # IMPORTANT: Only include documents that have the correct agentId to ensure relationship is verified
             try:
                 documents_query = self.documents_collection.where(
                     filter=FieldFilter('agentId', '==', agent_id)
@@ -2022,9 +2033,12 @@ class FirestoreService:
                 documents = list(documents_query.stream())
                 for doc in documents:
                     doc_data = doc.to_dict()
-                    client_id = doc_data.get('clientId') or doc_data.get('client_id')
-                    if client_id:
-                        client_ids.add(client_id)
+                    # Verify agentId matches (double-check for safety)
+                    doc_agent_id = doc_data.get('agentId') or doc_data.get('agent_id')
+                    if doc_agent_id == agent_id:
+                        client_id = doc_data.get('clientId') or doc_data.get('client_id')
+                        if client_id:
+                            client_ids.add(client_id)
             except Exception as e:
                 logger.warning(f"Error getting clients from documents for agent {agent_id}: {e}")
             
@@ -2041,6 +2055,7 @@ class FirestoreService:
             
             # Method 5: Get clients through properties managed by this agent
             # If agent manages a property, find clients that have property files for those properties
+            # IMPORTANT: Only include property files that also have the correct agent_id to ensure relationship is verified
             try:
                 # First get properties managed by this agent
                 properties_query = self.properties_collection.where(
@@ -2050,38 +2065,80 @@ class FirestoreService:
                 property_ids = {prop.id for prop in agent_properties}
                 
                 if property_ids:
-                    # Find property files for these properties
+                    # Find property files for these properties AND verify agent_id matches
                     # Use chunked queries since Firestore IN limit is 10
                     chunk_size = 10
                     for i in range(0, len(list(property_ids)), chunk_size):
                         property_chunk = list(property_ids)[i:i + chunk_size]
+                        # IMPORTANT: Filter by both property_id AND agent_id to ensure correct relationship
                         pf_query = self.property_files_collection.where(
                             filter=FieldFilter('property_id', 'in', property_chunk)
                         )
                         property_files = list(pf_query.stream())
                         for pf_doc in property_files:
                             pf_data = pf_doc.to_dict()
-                            client_id = pf_data.get('client_id')
-                            if client_id:
-                                client_ids.add(client_id)
+                            # Verify that the property file also has the correct agent_id
+                            pf_agent_id = pf_data.get('agent_id')
+                            if pf_agent_id == agent_id:
+                                client_id = pf_data.get('client_id')
+                                if client_id:
+                                    client_ids.add(client_id)
             except Exception as e:
                 logger.warning(f"Error getting clients through properties for agent {agent_id}: {e}")
             
             if not client_ids:
+                logger.info(f"No clients found for agent {agent_id}")
+                return [], 0
+            
+            logger.info(f"Found {len(client_ids)} unique client IDs for agent {agent_id} from verified sources")
+            
+            if not client_ids:
+                logger.info(f"No clients found for agent {agent_id} after verification")
                 return [], 0
             
             # Get clients by IDs using chunked IN queries
-            clients = self._fetch_documents_by_ids(self.clients_collection, client_ids)
+            all_clients = self._fetch_documents_by_ids(self.clients_collection, client_ids)
+            
+            # Ensure we only return clients that were actually found (filter out None/empty results)
+            all_clients = [c for c in all_clients if c and c.get('id')]
+            
+            # Final verification: Double-check that clients are correctly related to this agent
+            # STRICT FILTERING: Only include clients that:
+            # 1. Have their ID in our verified client_ids set (collected from verified sources with correct agent_id)
+            # 2. Either have no agent_id field OR have agent_id that matches this agent
+            # This ensures we NEVER return clients that belong to a different agent
+            verified_clients = []
+            for client in all_clients:
+                client_id = client.get('id')
+                if not client_id:
+                    continue
+                
+                # Only include client if it was found in our verified client_ids set
+                # This ensures the client has a verified relationship with this agent
+                if client_id in client_ids:
+                    # Additional verification: Check if client has agent_id field
+                    client_agent_id = client.get('agent_id') or client.get('agentId')
+                    # Include if:
+                    # - Client has no agent_id field (related through property files/documents) OR
+                    # - Client's agent_id matches this agent
+                    if not client_agent_id or client_agent_id == agent_id:
+                        verified_clients.append(client)
+                    else:
+                        # Client has a different agent_id - exclude it even if found in our set
+                        logger.warning(f"Excluding client {client_id}: has agent_id={client_agent_id} but expected {agent_id}")
+            
+            logger.info(f"Fetched {len(all_clients)} clients from DB, verified {len(verified_clients)} clients for agent {agent_id} (from {len(client_ids)} verified client IDs)")
             
             # Sort by created_at descending
-            clients.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
+            verified_clients.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
             
             # Apply pagination
             start_idx = (page - 1) * page_size
             end_idx = start_idx + page_size
-            paginated_clients = clients[start_idx:end_idx]
+            paginated_clients = verified_clients[start_idx:end_idx]
             
-            total = len(clients)
+            total = len(verified_clients)
+            logger.info(f"Returning {len(paginated_clients)} clients (page {page}, total {total}) for agent {agent_id}")
             return paginated_clients, total
         except Exception as e:
             logger.error(f"Failed to list clients by agent: {e}")
@@ -3100,6 +3157,7 @@ class FirestoreService:
     ) -> tuple[List[Dict[str, Any]], int]:
         """List deals with filters and pagination"""
         try:
+            # Build base query with filters (without order_by to avoid index requirement)
             query = self.deals_collection
             
             # Apply filters
@@ -3112,22 +3170,43 @@ class FirestoreService:
             if status:
                 query = query.where(filter=FieldFilter('status', '==', status))
             
-            query = query.order_by('createdAt', direction=Query.DESCENDING)
-            
-            if cursor_doc_id:
-                cursor_doc = self.deals_collection.document(cursor_doc_id).get()
-                if cursor_doc.exists:
-                    query = query.start_after(cursor_doc)
-            elif page > 1:
-                offset = (page - 1) * page_size
-                query = query.offset(offset)
-            
-            docs = list(query.limit(page_size).stream())
-            deals = []
-            for doc in docs:
-                data = doc.to_dict()
-                data['id'] = doc.id
-                deals.append(data)
+            # Try to use order_by with pagination, but if it fails (index not available), fetch all and sort in memory
+            try:
+                ordered_query = query.order_by('createdAt', direction=Query.DESCENDING)
+                
+                if cursor_doc_id:
+                    cursor_doc = self.deals_collection.document(cursor_doc_id).get()
+                    if cursor_doc.exists:
+                        ordered_query = ordered_query.start_after(cursor_doc)
+                elif page > 1:
+                    offset = (page - 1) * page_size
+                    ordered_query = ordered_query.offset(offset)
+                
+                docs = list(ordered_query.limit(page_size).stream())
+                deals = []
+                for doc in docs:
+                    data = doc.to_dict()
+                    data['id'] = doc.id
+                    deals.append(data)
+            except Exception as order_error:
+                # Index not available, fetch all and sort in memory
+                # Use the base query (without order_by) to avoid the index requirement
+                # This is expected behavior when index is not deployed, so use debug level
+                logger.debug(f"Index not available for ordered query, sorting in memory: {order_error}")
+                docs = list(query.stream())
+                all_deals = []
+                for doc in docs:
+                    data = doc.to_dict()
+                    data['id'] = doc.id
+                    all_deals.append(data)
+                
+                # Sort by createdAt descending
+                all_deals.sort(key=lambda x: x.get('createdAt', datetime.min), reverse=True)
+                
+                # Apply pagination
+                start_idx = (page - 1) * page_size
+                end_idx = start_idx + page_size
+                deals = all_deals[start_idx:end_idx]
             
             total = -1
             return deals, total
@@ -3161,9 +3240,10 @@ class FirestoreService:
     def get_deals_by_agent(self, agent_id: str) -> List[Dict[str, Any]]:
         """Get all deals for a specific agent"""
         try:
+            # Query without order_by to avoid index requirement, sort in memory instead
             query = self.deals_collection.where(
                 filter=FieldFilter('agentId', '==', agent_id)
-            ).order_by('createdAt', direction=Query.DESCENDING)
+            )
             
             docs = list(query.stream())
             deals = []
@@ -3171,6 +3251,9 @@ class FirestoreService:
                 data = doc.to_dict()
                 data['id'] = doc.id
                 deals.append(data)
+            
+            # Sort by createdAt descending in memory
+            deals.sort(key=lambda x: x.get('createdAt', datetime.min), reverse=True)
             
             return deals
         except Exception as e:

@@ -1392,36 +1392,36 @@ async def list_users(current_user: dict = Depends(get_current_user)):
 def calculate_agent_stats(agent_id: str) -> Dict[str, int]:
     """
     Calculate stats (properties_count, clients_count, documents_count) for a single agent.
-    Uses the same logic as the batch endpoint: deals + direct relationships.
+    Uses direct relationships (deals functionality commented out - not needed).
     
     Returns:
         Dict with 'properties_count', 'clients_count', 'documents_count'
     """
     try:
-        # Get deals for this agent
-        deals = firestore_service.get_deals_by_agent(agent_id)
+        # Get deals for this agent - COMMENTED OUT (deals not needed)
+        # deals = firestore_service.get_deals_by_agent(agent_id)
         
-        # Count unique clients and properties from deals
+        # Count unique clients and properties from deals - COMMENTED OUT
         client_ids_from_deals = set()
         property_ids_from_deals = set()
         
-        for deal in deals:
-            client_id = deal.get('clientId')
-            property_id = deal.get('propertyId')
-            if client_id:
-                client_ids_from_deals.add(client_id)
-            if property_id:
-                property_ids_from_deals.add(property_id)
+        # for deal in deals:
+        #     client_id = deal.get('clientId')
+        #     property_id = deal.get('propertyId')
+        #     if client_id:
+        #         client_ids_from_deals.add(client_id)
+        #     if property_id:
+        #         property_ids_from_deals.add(property_id)
         
-        # Also get properties directly linked to agent (in case no deals exist)
+        # Get properties directly linked to agent
         try:
             properties_query = firestore_service.properties_collection.where(
                 filter=FieldFilter('agentId', '==', agent_id)
             )
             properties_docs = list(properties_query.stream())
             property_ids_from_properties = {doc.id for doc in properties_docs}
-            # Combine with deals
-            property_ids = property_ids_from_deals.union(property_ids_from_properties)
+            # Use only direct properties (deals commented out)
+            property_ids = property_ids_from_properties  # property_ids_from_deals.union(property_ids_from_properties)
         except Exception as e:
             logger.warning(f"Error querying properties for agent {agent_id}: {e}")
             property_ids = property_ids_from_deals
@@ -1443,7 +1443,7 @@ def calculate_agent_stats(agent_id: str) -> Dict[str, int]:
                     documents_count = int(count_result[0][0].value)
             except Exception:
                 # If count aggregation fails, we'll estimate or skip
-                logger.warning(f"Count aggregation failed for agent {agent_id}, will use deals-only client count")
+                logger.warning(f"Count aggregation failed for agent {agent_id}, will use documents-only client count")
             
             # Extract unique client IDs from documents (for clients count)
             # OPTIMIZED: Only fetch clientId field to minimize data transfer
@@ -1471,16 +1471,16 @@ def calculate_agent_stats(agent_id: str) -> Dict[str, int]:
                         if client_id:
                             client_ids_from_docs.add(client_id)
                 except Exception:
-                    pass  # Will use deals-only client count
+                    pass  # Will use documents-only client count
             
-            # Combine clients from deals and documents
-            client_ids = client_ids_from_deals.union(client_ids_from_docs)
+            # Use only clients from documents (deals commented out)
+            client_ids = client_ids_from_docs  # client_ids_from_deals.union(client_ids_from_docs)
             clients_count = len(client_ids)
             
         except Exception as e:
             logger.warning(f"Error querying documents for agent {agent_id}: {e}")
-            # Fallback: use only deals data
-            clients_count = len(client_ids_from_deals)
+            # Fallback: no clients (deals commented out)
+            clients_count = 0  # len(client_ids_from_deals)
             documents_count = 0
         
         return {
@@ -1510,38 +1510,38 @@ def calculate_agent_stats_batch(agent_ids: List[str]) -> Dict[str, Dict[str, int
     stats = {agent_id: {'properties_count': 0, 'clients_count': 0, 'documents_count': 0} for agent_id in agent_ids}
     
     try:
-        # OPTIMIZATION 1: Batch fetch all deals for all agents
+        # OPTIMIZATION 1: Batch fetch all deals for all agents - COMMENTED OUT (deals not needed)
         # Firestore doesn't support whereIn for multiple agentIds efficiently, so we'll use a different approach
         # Get all deals and group by agentId in memory (faster than N queries)
-        all_deals = []
-        try:
-            # Get all deals (we'll filter by agentId in memory)
-            # This is faster than N separate queries if there aren't too many deals
-            deals_query = firestore_service.deals_collection.limit(10000)  # Reasonable limit
-            deals_docs = list(deals_query.stream())
-            for doc in deals_docs:
-                data = doc.to_dict()
-                data['id'] = doc.id
-                all_deals.append(data)
-        except Exception as e:
-            logger.warning(f"Error fetching deals for batch stats: {e}")
-            all_deals = []
+        # all_deals = []
+        # try:
+        #     # Get all deals (we'll filter by agentId in memory)
+        #     # This is faster than N separate queries if there aren't too many deals
+        #     deals_query = firestore_service.deals_collection.limit(10000)  # Reasonable limit
+        #     deals_docs = list(deals_query.stream())
+        #     for doc in deals_docs:
+        #         data = doc.to_dict()
+        #         data['id'] = doc.id
+        #         all_deals.append(data)
+        # except Exception as e:
+        #     logger.warning(f"Error fetching deals for batch stats: {e}")
+        #     all_deals = []
         
-        # Group deals by agentId
-        deals_by_agent = defaultdict(list)
+        # Group deals by agentId - COMMENTED OUT
+        # deals_by_agent = defaultdict(list)
         client_ids_from_deals_by_agent = defaultdict(set)
         property_ids_from_deals_by_agent = defaultdict(set)
         
-        for deal in all_deals:
-            agent_id = deal.get('agentId')
-            if agent_id and agent_id in agent_ids:
-                deals_by_agent[agent_id].append(deal)
-                client_id = deal.get('clientId')
-                property_id = deal.get('propertyId')
-                if client_id:
-                    client_ids_from_deals_by_agent[agent_id].add(client_id)
-                if property_id:
-                    property_ids_from_deals_by_agent[agent_id].add(property_id)
+        # for deal in all_deals:
+        #     agent_id = deal.get('agentId')
+        #     if agent_id and agent_id in agent_ids:
+        #         deals_by_agent[agent_id].append(deal)
+        #         client_id = deal.get('clientId')
+        #         property_id = deal.get('propertyId')
+        #         if client_id:
+        #             client_ids_from_deals_by_agent[agent_id].add(client_id)
+        #         if property_id:
+        #             property_ids_from_deals_by_agent[agent_id].add(property_id)
         
         # OPTIMIZATION 2: Batch fetch all properties for all agents
         property_ids_by_agent = defaultdict(set)
@@ -1557,9 +1557,9 @@ def calculate_agent_stats_batch(agent_ids: List[str]) -> Dict[str, Dict[str, int
         except Exception as e:
             logger.warning(f"Error fetching properties for batch stats: {e}")
         
-        # Combine property IDs from deals and direct properties
+        # Use only direct properties (deals commented out)
         for agent_id in agent_ids:
-            property_ids = property_ids_from_deals_by_agent[agent_id].union(property_ids_by_agent[agent_id])
+            property_ids = property_ids_by_agent[agent_id]  # property_ids_from_deals_by_agent[agent_id].union(property_ids_by_agent[agent_id])
             stats[agent_id]['properties_count'] = len(property_ids)
         
         # OPTIMIZATION 3: Batch fetch document counts using aggregation queries
@@ -1605,8 +1605,8 @@ def calculate_agent_stats_batch(agent_ids: List[str]) -> Dict[str, Dict[str, int
             # Documents count
             stats[agent_id]['documents_count'] = documents_count_by_agent.get(agent_id, 0)
             
-            # Clients count (from deals + documents)
-            client_ids = client_ids_from_deals_by_agent[agent_id].union(client_ids_from_docs_by_agent[agent_id])
+            # Clients count (from documents only - deals commented out)
+            client_ids = client_ids_from_docs_by_agent[agent_id]  # client_ids_from_deals_by_agent[agent_id].union(client_ids_from_docs_by_agent[agent_id])
             stats[agent_id]['clients_count'] = len(client_ids)
         
         return stats
@@ -7718,7 +7718,7 @@ async def get_agent(
                 agent_from_firestore = await run_blocking_with_timeout(
                     firestore_service.get_agent,
                     agent_id,
-                    timeout=4.0,
+                    timeout=10.0,
                     fallback=None,
                     description=f"Fetching agent {agent_id} from Firestore"
                 )
@@ -7742,7 +7742,7 @@ async def get_agent(
                 stats = await run_blocking_with_timeout(
                     calculate_agent_stats,
                     agent_id,
-                    timeout=6.0,
+                    timeout=20.0,
                     fallback=None,
                     description=f"Calculating stats for agent {agent_id}"
                 )
@@ -7976,19 +7976,134 @@ async def get_agent_properties(
     cursor: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Get all properties managed by a specific agent. All authenticated users can view properties."""
+    """Get all properties managed by a specific agent. Returns properties from direct relationships, documents, and property files.
+    (Deals functionality commented out - not needed)
+    Fetches ALL properties from all sources before applying pagination to ensure no data loss.
+    STRICTLY filters properties by agent_id - only returns properties that have a verified relationship with the specified agent.
+    All authenticated users can view properties."""
     check_firestore_available()
     
     try:
-        properties, total = firestore_service.list_properties_by_agent(
-            agent_id=agent_id,
-            page=page,
-            page_size=page_size,
-            cursor_doc_id=cursor
+        # Ensure agent_id is provided and valid
+        if not agent_id or not agent_id.strip():
+            raise HTTPException(status_code=400, detail="Agent ID is required")
+        
+        agent_id = agent_id.strip()
+        
+        # Collect property IDs from verified sources - all must have correct agent_id
+        property_ids = set()
+        
+        # Method 1: Get properties from deals collection - COMMENTED OUT (deals not needed)
+        # try:
+        #     deals = firestore_service.get_deals_by_agent(agent_id)
+        #     for deal in deals:
+        #         property_id = deal.get('propertyId')
+        #         if property_id:
+        #             property_ids.add(property_id)
+        # except Exception as e:
+        #     logger.warning(f"Error getting properties from deals for agent {agent_id}: {e}")
+        
+        # Method 2: Get properties directly linked to agent
+        try:
+            query = firestore_service.properties_collection.where(
+                filter=FieldFilter('agentId', '==', agent_id)
+            )
+            docs = list(query.stream())
+            for doc in docs:
+                property_ids.add(doc.id)
+        except Exception as e:
+            logger.warning(f"Error getting direct properties for agent {agent_id}: {e}")
+        
+        # Method 3: Get properties from documents with this agentId
+        # IMPORTANT: Only include documents that have the correct agentId to ensure relationship is verified
+        try:
+            documents_query = firestore_service.documents_collection.where(
+                filter=FieldFilter('agentId', '==', agent_id)
+            ).limit(10000)  # Reasonable limit to avoid timeout
+            documents = list(documents_query.stream())
+            for doc in documents:
+                doc_data = doc.to_dict()
+                # Verify agentId matches (double-check for safety)
+                doc_agent_id = doc_data.get('agentId') or doc_data.get('agent_id')
+                if doc_agent_id == agent_id:
+                    property_id = doc_data.get('propertyId') or doc_data.get('property_id')
+                    if property_id:
+                        property_ids.add(property_id)
+        except Exception as e:
+            logger.warning(f"Error getting properties from documents for agent {agent_id}: {e}")
+        
+        # Method 4: Get properties from property files with this agent_id
+        # IMPORTANT: Only include property files that have the correct agent_id to ensure relationship is verified
+        try:
+            property_files_query = firestore_service.property_files_collection.where(
+                filter=FieldFilter('agent_id', '==', agent_id)
+            )
+            property_files = list(property_files_query.stream())
+            for pf_doc in property_files:
+                pf_data = pf_doc.to_dict()
+                # Verify agent_id matches (double-check for safety)
+                pf_agent_id = pf_data.get('agent_id')
+                if pf_agent_id == agent_id:
+                    property_id = pf_data.get('property_id')
+                    if property_id:
+                        property_ids.add(property_id)
+        except Exception as e:
+            logger.warning(f"Error getting properties from property files for agent {agent_id}: {e}")
+        
+        if not property_ids:
+            return JSONResponse(content={
+                "success": True,
+                "properties": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size
+            })
+        
+        # Fetch ALL properties by IDs using chunked IN queries
+        all_properties = firestore_service._fetch_documents_by_ids(
+            firestore_service.properties_collection,
+            property_ids
         )
+        
+        # Final verification: Ensure all properties are correctly related to this agent
+        # STRICT FILTERING: Only include properties that:
+        # 1. Have their ID in our verified property_ids set (collected from verified sources with correct agent_id)
+        # 2. Either have no agentId field OR have agentId that matches this agent
+        # This ensures we NEVER return properties that belong to a different agent
+        verified_properties = []
+        for prop in all_properties:
+            prop_id = prop.get('id')
+            if not prop_id:
+                continue
+            
+            # Only include property if it was found in our verified property_ids set
+            # This ensures the property has a verified relationship with this agent
+            if prop_id in property_ids:
+                # Additional verification: Check if property has agentId field
+                prop_agent_id = prop.get('agentId') or prop.get('agent_id')
+                # Include if:
+                # - Property has no agentId field (related through documents/property files) OR
+                # - Property's agentId matches this agent
+                if not prop_agent_id or prop_agent_id == agent_id:
+                    verified_properties.append(prop)
+                else:
+                    # Property has a different agentId - exclude it even if found in our set
+                    logger.warning(f"Excluding property {prop_id}: has agentId={prop_agent_id} but expected {agent_id}")
+        
+        logger.info(f"Fetched {len(all_properties)} properties from DB, verified {len(verified_properties)} properties for agent {agent_id} (from {len(property_ids)} verified property IDs)")
+        
+        # Sort by created_at descending
+        verified_properties.sort(key=lambda x: x.get('created_at', datetime.min), reverse=True)
+        
+        # Apply pagination AFTER combining all properties
+        total = len(verified_properties)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_properties = verified_properties[start_idx:end_idx]
+        
         return JSONResponse(content={
             "success": True,
-            "properties": convert_decimals(properties),
+            "properties": convert_decimals(paginated_properties),
             "total": total,
             "page": page,
             "page_size": page_size
@@ -8034,27 +8149,54 @@ async def get_agent_clients(
     cursor: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Get all clients related to documents uploaded by a specific agent. All authenticated users can view clients."""
+    """Get all clients related to a specific agent through property files, documents, or direct relationships.
+    (Deals functionality commented out - not needed)
+    STRICTLY filters clients by agent_id - only returns clients that have a verified relationship with the specified agent.
+    All authenticated users can view clients."""
     check_firestore_available()
     
     try:
+        logger.info(f"Fetching clients for agent {agent_id} (page {page}, page_size {page_size})")
+        
+        # Ensure agent_id is provided and valid
+        if not agent_id or not agent_id.strip():
+            raise HTTPException(status_code=400, detail="Agent ID is required")
+        
         clients, total = firestore_service.list_clients_by_agent(
-            agent_id=agent_id,
+            agent_id=agent_id.strip(),
             page=page,
             page_size=page_size,
             cursor_doc_id=cursor
         )
+        
+        # Final verification: Ensure all returned clients are related to this agent
+        # This is a safety check to prevent any clients from other agents
+        verified_clients = []
+        for client in clients:
+            client_id = client.get('id')
+            client_agent_id = client.get('agent_id') or client.get('agentId')
+            
+            # Only include if client has no agent_id (related through other means) OR agent_id matches
+            if not client_agent_id or client_agent_id == agent_id:
+                verified_clients.append(client)
+            else:
+                logger.warning(f"Filtered out client {client_id}: agent_id={client_agent_id} does not match requested agent {agent_id}")
+        
+        logger.info(f"Returning {len(verified_clients)} verified clients for agent {agent_id} (total: {total}, filtered from {len(clients)})")
+        
         return JSONResponse(content={
             "success": True,
-            "clients": convert_decimals(clients),
-            "total": total,
+            "clients": convert_decimals(verified_clients),
+            "total": len(verified_clients),  # Use verified count
             "page": page,
             "page_size": page_size
         })
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting agent clients: {e}")
+        logger.error(f"Error getting agent clients for agent {agent_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/property-files")
