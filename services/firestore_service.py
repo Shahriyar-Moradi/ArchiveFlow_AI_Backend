@@ -349,6 +349,24 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to delete document record: {e}")
             return False
+
+    def _delete_documents_by_field(self, field_name: str, value: str, batch_size: int = 500) -> int:
+        """Delete documents matching a field value, returns number deleted."""
+        deleted = 0
+        try:
+            while True:
+                query = self.documents_collection.where(
+                    filter=FieldFilter(field_name, '==', value)
+                ).limit(batch_size)
+                docs = list(query.stream())
+                if not docs:
+                    break
+                for doc in docs:
+                    doc.reference.delete()
+                    deleted += 1
+        except Exception as e:
+            logger.warning(f"Failed to delete documents by {field_name}={value}: {e}")
+        return deleted
     
     # Job Operations
     
@@ -387,8 +405,24 @@ class FirestoreService:
         try:
             doc_ref = self.jobs_collection.document(job_id)
             data['updated_at'] = firestore.SERVER_TIMESTAMP
-            doc_ref.update(data)
-            logger.info(f"Updated job record: {job_id}")
+
+            # If the job doesn't exist yet, create it with sensible defaults before updating
+            doc = doc_ref.get()
+            if not doc.exists:
+                base_data = {
+                    'status': data.get('status', 'pending'),
+                    'created_at': firestore.SERVER_TIMESTAMP,
+                    'updated_at': firestore.SERVER_TIMESTAMP,
+                    'processed_documents': 0,
+                    'failed_documents': 0,
+                }
+                base_data.update({k: v for k, v in data.items() if k not in base_data})
+                doc_ref.set(base_data)
+                logger.info(f"Created missing job record while updating: {job_id}")
+            else:
+                doc_ref.update(data)
+                logger.info(f"Updated job record: {job_id}")
+
             return True
         except Exception as e:
             logger.error(f"Failed to update job record: {e}")
@@ -400,19 +434,29 @@ class FirestoreService:
             doc_ref = self.jobs_collection.document(job_id)
             update_data = {'updated_at': firestore.SERVER_TIMESTAMP}
             
+            doc = doc_ref.get()
+            if not doc.exists:
+                # Create a new job doc if missing to avoid 404 errors during progress updates
+                base_data = {
+                    'status': status or 'pending',
+                    'created_at': firestore.SERVER_TIMESTAMP,
+                    'updated_at': firestore.SERVER_TIMESTAMP,
+                    'processed_documents': max(processed, 0),
+                    'failed_documents': max(failed, 0),
+                }
+                doc_ref.set(base_data)
+                logger.info(f"Created missing job record while updating progress: {job_id}")
+                return True
+            
+            current_data = doc.to_dict() or {}
+            
             if processed > 0:
-                doc = doc_ref.get()
-                if doc.exists:
-                    current_data = doc.to_dict()
-                    current_processed = current_data.get('processed_documents', 0)
-                    update_data['processed_documents'] = current_processed + processed
+                current_processed = current_data.get('processed_documents', 0)
+                update_data['processed_documents'] = current_processed + processed
             
             if failed > 0:
-                doc = doc_ref.get()
-                if doc.exists:
-                    current_data = doc.to_dict()
-                    current_failed = current_data.get('failed_documents', 0)
-                    update_data['failed_documents'] = current_failed + failed
+                current_failed = current_data.get('failed_documents', 0)
+                update_data['failed_documents'] = current_failed + failed
             
             if status:
                 update_data['status'] = status
@@ -919,11 +963,24 @@ class FirestoreService:
             return False
     
     def delete_client(self, client_id: str) -> bool:
-        """Delete a client record"""
+        """Delete a client record and all related data (property files + documents)."""
         try:
+            # Delete property files and their linked documents
+            property_files = self.get_property_files_by_client(client_id)
+            for pf in property_files:
+                pf_id = pf.get('id')
+                if pf_id:
+                    self.delete_property_file(pf_id)
+
+            # Delete stray documents that reference this client directly
+            deleted_docs = 0
+            deleted_docs += self._delete_documents_by_field('clientId', client_id)
+            deleted_docs += self._delete_documents_by_field('client_id', client_id)
+
+            # Finally delete the client record
             doc_ref = self.clients_collection.document(client_id)
             doc_ref.delete()
-            logger.info(f"Deleted client record: {client_id}")
+            logger.info(f"Deleted client record: {client_id} (property_files={len(property_files)}, documents={deleted_docs})")
             return True
         except Exception as e:
             logger.error(f"Failed to delete client record: {e}")
@@ -1007,6 +1064,30 @@ class FirestoreService:
             return True
         except Exception as e:
             logger.error(f"Failed to update property record: {e}")
+            return False
+
+    def delete_property(self, property_id: str) -> bool:
+        """Delete a property and all related records (property files + documents)."""
+        try:
+            # Delete property files for this property (will also delete linked documents)
+            property_files = self.get_property_files_by_property(property_id)
+            for pf in property_files:
+                pf_id = pf.get('id')
+                if pf_id:
+                    self.delete_property_file(pf_id)
+
+            # Delete stray documents that reference this property directly
+            deleted_docs = 0
+            deleted_docs += self._delete_documents_by_field('propertyId', property_id)
+            deleted_docs += self._delete_documents_by_field('property_id', property_id)
+
+            # Delete the property record itself
+            doc_ref = self.properties_collection.document(property_id)
+            doc_ref.delete()
+            logger.info(f"Deleted property record: {property_id} (property_files={len(property_files)}, documents={deleted_docs})")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete property record: {e}")
             return False
     
     def list_properties(
@@ -1197,6 +1278,47 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to update property file record: {e}")
             return False
+
+    def _normalize_property_file_links(
+        self,
+        property_file: Dict[str, Any],
+        expected_client_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Ensure property file relationship fields use snake_case and are present.
+        
+        - Backfills client_id/property_id from legacy camelCase fields.
+        - Persists the normalized fields to Firestore when missing.
+        - Mutates and returns the provided property_file dict for immediate use.
+        """
+        try:
+            property_file_id = property_file.get('id')
+            update_data: Dict[str, Any] = {}
+            
+            client_id = property_file.get('client_id') or property_file.get('clientId')
+            if expected_client_id:
+                if not client_id or client_id != expected_client_id:
+                    client_id = expected_client_id
+            property_id = property_file.get('property_id') or property_file.get('propertyId')
+            
+            if client_id and property_file.get('client_id') != client_id:
+                update_data['client_id'] = client_id
+            if property_id and property_file.get('property_id') != property_id:
+                update_data['property_id'] = property_id
+            
+            if update_data and property_file_id:
+                # Persist the normalized relationship fields
+                self.update_property_file(property_file_id, update_data)
+                property_file.update(update_data)
+            
+            if client_id:
+                property_file['client_id'] = client_id
+            if property_id:
+                property_file['property_id'] = property_id
+        except Exception as e:
+            logger.warning(f"Failed to normalize property file {property_file.get('id')}: {e}")
+        
+        return property_file
     
     def update_property_file_client_id(self, property_file_id: str, client_id: str) -> bool:
         """
@@ -1246,62 +1368,126 @@ class FirestoreService:
             return False
     
     def delete_property_file(self, property_file_id: str) -> bool:
-        """Delete a property file record"""
+        """Delete a property file record and any linked documents."""
         try:
+            property_file = self.get_property_file(property_file_id)
+            linked_doc_ids = self._collect_property_file_document_ids(property_file) if property_file else []
+
+            # Delete linked documents first so analytics stay consistent
+            for doc_id in linked_doc_ids:
+                self.delete_document(doc_id)
+
             doc_ref = self.property_files_collection.document(property_file_id)
             doc_ref.delete()
-            logger.info(f"Deleted property file record: {property_file_id}")
+            logger.info(f"Deleted property file record: {property_file_id} (linked_docs={len(linked_doc_ids)})")
             return True
         except Exception as e:
             logger.error(f"Failed to delete property file record: {e}")
             return False
+
+    def _collect_property_file_document_ids(self, property_file: Optional[Dict[str, Any]]) -> List[str]:
+        """Return all document IDs linked to a property file."""
+        if not property_file:
+            return []
+        doc_fields = [
+            'spa_document_id',
+            'invoice_document_id',
+            'id_document_id',
+            'proof_of_payment_document_id',
+            'spaDocumentId',
+            'invoiceDocumentId',
+            'idDocumentId',
+            'proofOfPaymentDocumentId'
+        ]
+        doc_ids = []
+        for field in doc_fields:
+            doc_id = property_file.get(field)
+            if doc_id:
+                doc_ids.append(doc_id)
+        return doc_ids
     
     def get_property_files_by_client(self, client_id: str) -> List[Dict[str, Any]]:
         """Get all property files for a client"""
         try:
-            # Try query with order_by first (requires composite index)
-            try:
-                query = self.property_files_collection.where(
-                    filter=FieldFilter('client_id', '==', client_id)
-                ).order_by('created_at', direction=Query.DESCENDING)
-                docs = list(query.stream())
-            except Exception as index_error:
-                # If index error, fall back to query without order_by
-                if 'index' in str(index_error).lower() or '400' in str(index_error):
-                    logger.warning(f"Index not available for property_files query, using fallback without order_by: {index_error}")
+            def _fetch_docs_for_field(field_name: str) -> List[Any]:
+                """Fetch property files filtered by the provided client field with index-safe fallback."""
+                try:
                     query = self.property_files_collection.where(
-                        filter=FieldFilter('client_id', '==', client_id)
-                    )
-                    docs = list(query.stream())
-                    # Sort in memory by created_at descending
-                    docs_list = [(doc, doc.to_dict().get('created_at')) for doc in docs]
-                    docs_list.sort(key=lambda x: x[1] or 0, reverse=True)
-                    docs = [doc for doc, _ in docs_list]
-                else:
+                        filter=FieldFilter(field_name, '==', client_id)
+                    ).order_by('created_at', direction=Query.DESCENDING)
+                    return list(query.stream())
+                except Exception as index_error:
+                    if 'index' in str(index_error).lower() or '400' in str(index_error):
+                        logger.warning(f"Index not available for property_files query on {field_name}, using fallback without order_by: {index_error}")
+                        query = self.property_files_collection.where(
+                            filter=FieldFilter(field_name, '==', client_id)
+                        )
+                        docs = list(query.stream())
+                        docs_list = [(doc, doc.to_dict().get('created_at')) for doc in docs]
+                        docs_list.sort(key=lambda x: x[1] or 0, reverse=True)
+                        return [doc for doc, _ in docs_list]
                     raise
             
+            # Support both snake_case and legacy camelCase client fields
+            docs = _fetch_docs_for_field('client_id')
+            docs += _fetch_docs_for_field('clientId')
+            
             property_files = []
-            for doc in docs:
-                data = doc.to_dict()
-                data['id'] = doc.id
-                
-                # Enrich with property name/title if property_id exists
-                property_id = data.get('property_id')
-                if property_id:
-                    try:
-                        property_obj = self.get_property(property_id)
-                        if property_obj:
-                            # Prefer title, then name, then reference
-                            data['property_name'] = property_obj.get('title') or property_obj.get('name') or property_obj.get('reference') or data.get('property_reference')
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch property {property_id} for property file: {e}")
-                        # Fallback to property_reference if property fetch fails
+            seen_ids = set()
+            
+            def _process_docs(documents: List[Any]):
+                for doc in documents:
+                    if doc.id in seen_ids:
+                        continue
+                    
+                    data = doc.to_dict()
+                    data['id'] = doc.id
+                    # Normalize relationships and persist fixes if needed
+                    data = self._normalize_property_file_links(data, expected_client_id=client_id)
+                    
+                    # Enrich with property name/title if property_id exists
+                    property_id = data.get('property_id')
+                    if property_id:
+                        try:
+                            property_obj = self.get_property(property_id)
+                            if property_obj:
+                                data['property_name'] = property_obj.get('title') or property_obj.get('name') or property_obj.get('reference') or data.get('property_reference')
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch property {property_id} for property file: {e}")
+                            data['property_name'] = data.get('property_reference')
+                    else:
                         data['property_name'] = data.get('property_reference')
-                else:
-                    # No property_id, use property_reference as fallback
-                    data['property_name'] = data.get('property_reference')
-                
-                property_files.append(data)
+                    
+                    property_files.append(data)
+                    seen_ids.add(doc.id)
+            
+            _process_docs(docs)
+            
+            # Fallback: if no direct matches, try matching by client_full_name and fix missing client_id
+            if not property_files:
+                try:
+                    client = self.get_client(client_id)
+                    if client and client.get('full_name'):
+                        query = self.property_files_collection.where(
+                            filter=FieldFilter('client_full_name', '==', client.get('full_name'))
+                        )
+                        name_docs = list(query.stream())
+                        _process_docs(name_docs)
+                        
+                        # Update fetched files to have the correct client_id when missing/wrong
+                        for pf in property_files:
+                            pf_client_id = pf.get('client_id')
+                            pf_id = pf.get('id')
+                            if pf_id and pf_client_id != client_id:
+                                self.update_property_file_client_id(pf_id, client_id)
+                                pf['client_id'] = client_id
+                                logger.info(f"Fixed property file {pf_id} client_id from {pf_client_id} to {client_id}")
+                except Exception as e:
+                    logger.warning(f"Failed fallback property file search by client name for {client_id}: {e}")
+            
+            # If we still have no property files, return empty list
+            if not property_files:
+                return []
             
             return property_files
         except Exception as e:
@@ -1366,67 +1552,285 @@ class FirestoreService:
         self,
         client_full_name: str,
         property_reference: Optional[str] = None,
-        transaction_type: Optional[str] = None
+        property_name: Optional[str] = None,
+        property_address: Optional[str] = None,
+        transaction_type: Optional[str] = None,
+        is_id_document: bool = False
     ) -> List[Dict[str, Any]]:
-        """Find matching property files using fuzzy matching with improved logic"""
+        """
+        Find matching property files using two-stage matching:
+        1. Primary Stage: Match by client full name (REQUIRED)
+        2. Secondary Stage: Use property information as tiebreaker when multiple matches exist
+        
+        For ID documents (is_id_document=True):
+        - Transaction type matching is optional (not required)
+        - All property files are considered regardless of transaction type
+        - Property files with matching transaction type are preferred but not required
+        
+        Returns all property files that match the client name, sorted by:
+        - Name score (highest first)
+        - Transaction type match (for ID documents, prefer but don't require)
+        - Property score (if available, as tiebreaker)
+        """
         try:
             from services.matching_service import MatchingService
+            
+            if not client_full_name:
+                logger.warning(f"find_matching_property_file called with empty client_full_name")
+                return []
+            
+            # Thresholds (improved matching - more lenient to catch valid matches)
+            NAME_THRESHOLD_PRIMARY = 0.70  # Lowered from 0.75 to catch more valid matches
+            NAME_THRESHOLD_RELAXED = 0.65  # Fallback for edge cases
+            NAME_THRESHOLD_LENIENT = 0.60  # Final fallback for very similar names
+            PROP_THRESHOLD_TIEBREAKER = 0.60  # Only used as tiebreaker, not blocker
+            
+            logger.info(
+                f"🔍 Starting property file matching for client: '{client_full_name}' "
+                f"(property_reference: {property_reference or 'None'}, "
+                f"transaction_type: {transaction_type or 'None'}, "
+                f"is_id_document: {is_id_document})"
+            )
             
             # Normalize search terms using matching service
             normalized_name = MatchingService.normalize_name(client_full_name)
             
-            # Get all property files and filter in memory
-            query = self.property_files_collection
-            if transaction_type:
-                query = query.where(filter=FieldFilter('transaction_type', '==', transaction_type))
+            # Build property hints - only consider meaningful (non-empty) values
+            # For ID documents, explicitly clear property hints (ID documents don't have property info)
+            if is_id_document:
+                property_hints = []  # ID documents don't have property info
+                has_property_hints = False
+                logger.info(f"ID document matching: Using client name only (no property information available)")
+            else:
+                property_hints = []
+                if property_reference and property_reference.strip():
+                    property_hints.append(property_reference.strip())
+                if property_name and property_name.strip():
+                    property_hints.append(property_name.strip())
+                if property_address and property_address.strip():
+                    property_hints.append(property_address.strip())
+                
+                # Normalize property hints
+                property_hints = [MatchingService.normalize_name(h) for h in property_hints if h]
+                has_property_hints = len(property_hints) > 0
             
+            # Get all property files and filter in memory
+            # IMPORTANT: Don't filter by transaction_type at query level - get all property files
+            # We'll filter by transaction_type in-memory to allow better matching logic
+            # This prevents missing valid matches due to strict query filtering
+            query = self.property_files_collection
             docs = list(query.stream())
-            matches = []
+            
+            logger.debug(f"Retrieved {len(docs)} property files from database for evaluation")
+            candidates = []
             
             for doc in docs:
                 data = doc.to_dict()
                 file_name = data.get('client_full_name', '')
                 file_reference = data.get('property_reference', '') if data.get('property_reference') else ''
+                file_prop_name = data.get('property_name', '')
+                file_prop_address = data.get('property_address', '') or data.get('address', '')
                 file_transaction_type = data.get('transaction_type')
+                
+                # Skip if file_name is empty
+                if not file_name or not file_name.strip():
+                    logger.debug(f"Skipping property file {doc.id}: empty client_full_name")
+                    continue
                 
                 # Normalize file name for comparison
                 normalized_file_name = MatchingService.normalize_name(file_name)
                 
                 # Use similarity score for name matching (more accurate than substring)
                 name_score = MatchingService.similarity_score(normalized_name, normalized_file_name)
-                name_match = name_score >= 0.75  # 75% similarity threshold
                 
-                # Check property reference match if provided
-                # If property_reference is None, match by client name only (allow matching)
-                property_match = True
-                if property_reference:
-                    normalized_ref = property_reference.lower().strip()
-                    file_ref_normalized = file_reference.lower().strip() if file_reference else ''
-                    # Use similarity for property reference
-                    if file_ref_normalized:
-                        ref_score = MatchingService.similarity_score(normalized_ref, file_ref_normalized)
-                        property_match = ref_score >= 0.8  # Higher threshold for property reference
-                    else:
-                        # If property file has no reference but we're searching with one, allow match
-                        # (property reference might be added later or might be optional)
-                        property_match = True
-                # If property_reference is None, match by name only (property_match = True already set)
-                # This allows matching documents even when property reference is missing
+                logger.debug(
+                    f"Evaluating property file {doc.id}: "
+                    f"file_client='{file_name}' (normalized: '{normalized_file_name}'), "
+                    f"search_client='{client_full_name}' (normalized: '{normalized_name}'), "
+                    f"name_score={name_score:.3f}"
+                )
+                
+                # Build property strings for the property file and compute best property score
+                file_props = []
+                if file_reference and file_reference.strip():
+                    file_props.append(MatchingService.normalize_name(file_reference.strip()))
+                if file_prop_name and file_prop_name.strip():
+                    file_props.append(MatchingService.normalize_name(file_prop_name.strip()))
+                if file_prop_address and file_prop_address.strip():
+                    file_props.append(MatchingService.normalize_name(file_prop_address.strip()))
+                
+                prop_score = None
+                if has_property_hints and file_props:
+                    # Best pairwise score across hints and file props
+                    prop_score = max(
+                        (MatchingService.similarity_score(h, fp) for h in property_hints for fp in file_props),
+                        default=None
+                    )
                 
                 # Check transaction type match if specified
                 transaction_match = True
                 if transaction_type and file_transaction_type:
                     transaction_match = transaction_type.upper() == file_transaction_type.upper()
                 
-                if name_match and property_match and transaction_match:
-                    data['id'] = doc.id
-                    data['match_confidence'] = name_score  # Store confidence score
-                    matches.append(data)
+                # Ensure id is always set (doc.id should never be None, but add fallback for safety)
+                doc_id = doc.id
+                if not doc_id:
+                    import uuid
+                    doc_id = str(uuid.uuid4())
+                    logger.warning(f"Property file document has no id, generated fallback id: {doc_id}")
+                
+                candidates.append({
+                    **data,
+                    'id': doc_id,
+                    'name_score': name_score,
+                    'property_score': prop_score,
+                    'transaction_match': transaction_match
+                })
             
-            # Sort by confidence score (highest first)
-            matches.sort(key=lambda x: x.get('match_confidence', 0.0), reverse=True)
+            # Stage 1: Filter by client name (REQUIRED) - primary threshold
+            # For ID documents, don't require transaction_match (transaction type is optional)
+            # For other documents, transaction_match is preferred but not strictly required at this stage
+            name_matches = [
+                c for c in candidates
+                if c['name_score'] >= NAME_THRESHOLD_PRIMARY
+            ]
             
-            return matches
+            # For non-ID documents, prefer transaction_match but don't exclude all non-matches
+            # We'll sort by transaction_match later to prefer matching transaction types
+            if not is_id_document and transaction_type:
+                # Separate matches into transaction_match=True and False
+                matching_transaction = [c for c in name_matches if c['transaction_match']]
+                non_matching_transaction = [c for c in name_matches if not c['transaction_match']]
+                
+                if matching_transaction:
+                    logger.info(f"Stage 1: Found {len(matching_transaction)} matches with matching transaction type, {len(non_matching_transaction)} with non-matching")
+                    # Prefer matches with correct transaction type, but keep others as fallback
+                    name_matches = matching_transaction + non_matching_transaction
+                else:
+                    logger.info(f"Stage 1: Found {len(name_matches)} matches but none with matching transaction type - keeping all for consideration")
+            else:
+                logger.info(f"Stage 1: Found {len(name_matches)} matches (ID document or no transaction type filter)")
+            
+            # Stage 2: Relaxed fallback if no primary matches
+            if not name_matches:
+                logger.debug(f"Stage 2: No matches with primary threshold {NAME_THRESHOLD_PRIMARY}, trying relaxed threshold {NAME_THRESHOLD_RELAXED}")
+                name_matches = [
+                    c for c in candidates
+                    if c['name_score'] >= NAME_THRESHOLD_RELAXED
+                ]
+                
+                if not is_id_document and transaction_type:
+                    matching_transaction = [c for c in name_matches if c['transaction_match']]
+                    non_matching_transaction = [c for c in name_matches if not c['transaction_match']]
+                    if matching_transaction:
+                        name_matches = matching_transaction + non_matching_transaction
+                
+                logger.info(f"Stage 2: Found {len(name_matches)} matches with relaxed threshold {NAME_THRESHOLD_RELAXED}")
+            
+            # Stage 3: Lenient fallback if still no matches (final attempt)
+            if not name_matches:
+                logger.debug(f"Stage 3: No matches with relaxed threshold {NAME_THRESHOLD_RELAXED}, trying lenient threshold {NAME_THRESHOLD_LENIENT}")
+                name_matches = [
+                    c for c in candidates
+                    if c['name_score'] >= NAME_THRESHOLD_LENIENT
+                ]
+                
+                if not is_id_document and transaction_type:
+                    matching_transaction = [c for c in name_matches if c['transaction_match']]
+                    non_matching_transaction = [c for c in name_matches if not c['transaction_match']]
+                    if matching_transaction:
+                        name_matches = matching_transaction + non_matching_transaction
+                
+                logger.info(f"Stage 3: Found {len(name_matches)} matches with lenient threshold {NAME_THRESHOLD_LENIENT}")
+                
+                # Log candidates that were close but didn't make the threshold
+                close_candidates = [c for c in candidates if NAME_THRESHOLD_LENIENT > c['name_score'] >= 0.50]
+                if close_candidates:
+                    logger.debug(f"Close matches that didn't meet lenient threshold: {len(close_candidates)} candidates")
+                    for c in sorted(close_candidates, key=lambda x: x['name_score'], reverse=True)[:5]:  # Top 5
+                        logger.debug(f"  - {c.get('id', 'unknown')}: name_score={c['name_score']:.3f}, client='{c.get('client_full_name', 'N/A')}'")
+            
+            # Stage 3: Sort matches - for ID documents, prefer transaction_match but don't require it
+            if is_id_document:
+                # For ID documents: sort by name score, then transaction match (prefer matching), then property
+                name_matches.sort(
+                    key=lambda x: (
+                        x['name_score'],
+                        1.0 if x['transaction_match'] else 0.0,  # Prefer matching transaction type
+                        x.get('property_score', 0.0) if x.get('property_score') is not None else 0.0
+                    ),
+                    reverse=True
+                )
+            elif len(name_matches) > 1 and has_property_hints:
+                # For other documents: sort by name score first, then property score as tiebreaker
+                name_matches.sort(
+                    key=lambda x: (
+                        x['name_score'],
+                        x.get('property_score', 0.0) if x.get('property_score') is not None else 0.0
+                    ),
+                    reverse=True
+                )
+                # If property score is available and significant, prefer matches with property
+                # But don't filter out matches without property - just rank them lower
+            else:
+                # Sort by name score only
+                name_matches.sort(key=lambda x: x['name_score'], reverse=True)
+            
+            # Attach confidence scores
+            for item in name_matches:
+                item['match_confidence'] = MatchingService.calculate_confidence(
+                    item.get('name_score', 0.0),
+                    item.get('property_score')
+                )
+            
+            # Final sort by confidence (which already considers both name and property)
+            name_matches.sort(key=lambda x: x.get('match_confidence', 0.0), reverse=True)
+            
+            # Determine which threshold was used (for logging)
+            threshold_used = NAME_THRESHOLD_PRIMARY
+            if name_matches:
+                min_score = min(c.get('name_score', 0.0) for c in name_matches)
+                if min_score < NAME_THRESHOLD_RELAXED:
+                    threshold_used = NAME_THRESHOLD_LENIENT
+                elif min_score < NAME_THRESHOLD_PRIMARY:
+                    threshold_used = NAME_THRESHOLD_RELAXED
+            
+            logger.info(
+                f"✅ Found {len(name_matches)} property file match(es) for client '{client_full_name}' "
+                f"(threshold used: {threshold_used:.2f}, "
+                f"has property hints: {has_property_hints}, "
+                f"is_id_document: {is_id_document})"
+            )
+            
+            # Log details about each match found
+            if name_matches:
+                for i, match in enumerate(name_matches[:5], 1):  # Log top 5 matches
+                    logger.info(
+                        f"  Match #{i}: Property File ID={match.get('id', 'N/A')}, "
+                        f"client='{match.get('client_full_name', 'N/A')}', "
+                        f"property_ref='{match.get('property_reference', 'N/A')}', "
+                        f"name_score={match.get('name_score', 0.0):.3f}, "
+                        f"property_score={match.get('property_score', 'N/A')}, "
+                        f"confidence={match.get('match_confidence', 0.0):.3f}, "
+                        f"transaction_type='{match.get('transaction_type', 'N/A')}', "
+                        f"transaction_match={match.get('transaction_match', False)}"
+                    )
+            else:
+                logger.warning(
+                    f"❌ No property file matches found for client '{client_full_name}'. "
+                    f"Evaluated {len(candidates)} candidates. "
+                    f"Highest name_score was: {max((c.get('name_score', 0.0) for c in candidates), default=0.0):.3f}"
+                )
+                # Log top 3 candidates that didn't match for debugging
+                top_candidates = sorted(candidates, key=lambda x: x.get('name_score', 0.0), reverse=True)[:3]
+                for i, c in enumerate(top_candidates, 1):
+                    logger.debug(
+                        f"  Non-match #{i}: Property File ID={c.get('id', 'N/A')}, "
+                        f"client='{c.get('client_full_name', 'N/A')}', "
+                        f"name_score={c.get('name_score', 0.0):.3f} (below threshold {NAME_THRESHOLD_LENIENT:.2f})"
+                    )
+            
+            return name_matches
         except Exception as e:
             logger.error(f"Failed to find matching property file: {e}")
             import traceback
@@ -1783,6 +2187,7 @@ class FirestoreService:
         try:
             # Use deals collection for efficient querying
             deals = self.get_deals_by_client(client_id)
+            property_files: List[Dict[str, Any]] = []
             
             # Extract unique property IDs from deals
             property_ids = set()
@@ -1810,7 +2215,8 @@ class FirestoreService:
                             for doc in docs:
                                 data = doc.to_dict()
                                 data['id'] = doc.id
-                                property_files.append(data)
+                                # Normalize and persist missing links
+                                property_files.append(self._normalize_property_file_links(data, expected_client_id=client_id))
                             
                             # Fix data consistency: update property files with correct client_id
                             for pf in property_files:
@@ -1834,7 +2240,7 @@ class FirestoreService:
                 
                 # Extract property IDs from property files
                 for pf in property_files:
-                    prop_id = pf.get('property_id')
+                    prop_id = pf.get('property_id') or pf.get('propertyId')
                     if prop_id:
                         property_ids.add(prop_id)
             
@@ -1846,7 +2252,7 @@ class FirestoreService:
             property_references_only = set()  # References from files without property_id
             
             for pf in property_files:
-                property_id = pf.get('property_id')
+                property_id = pf.get('property_id') or pf.get('propertyId')
                 property_reference = pf.get('property_reference')
                 
                 if property_id:
@@ -2089,29 +2495,41 @@ class FirestoreService:
             # Batch fetch property files for these clients using chunked IN queries
             # This avoids streaming the entire collection and only fetches relevant files
             property_files_by_client = {}
+            seen_property_file_ids = set()
             try:
                 if client_ids:
                     # Chunk client_ids into batches of 10 (Firestore IN limit)
                     chunk_size = 10
-                    all_property_files = []
+                    
+                    def add_property_file(pf_data: Dict[str, Any]):
+                        pf_id = pf_data.get('id')
+                        if pf_id in seen_property_file_ids:
+                            return
+                        
+                        normalized_pf = self._normalize_property_file_links(pf_data)
+                        pf_client_id = normalized_pf.get('client_id') or normalized_pf.get('clientId')
+                        if pf_client_id and pf_client_id in client_ids:
+                            property_files_by_client.setdefault(pf_client_id, []).append(normalized_pf)
+                            seen_property_file_ids.add(pf_id)
                     
                     for i in range(0, len(client_ids), chunk_size):
                         chunk_client_ids = client_ids[i : i + chunk_size]
-                        query = self.property_files_collection.where(
-                            filter=FieldFilter('client_id', 'in', chunk_client_ids)
-                        )
-                        for pf_doc in query.stream():
-                            pf_data = pf_doc.to_dict()
-                            pf_data['id'] = pf_doc.id
-                            all_property_files.append(pf_data)
-                    
-                    # Group property files by client_id
-                    for pf_data in all_property_files:
-                        pf_client_id = pf_data.get('client_id')
-                        if pf_client_id and pf_client_id in client_ids:
-                            if pf_client_id not in property_files_by_client:
-                                property_files_by_client[pf_client_id] = []
-                            property_files_by_client[pf_client_id].append(pf_data)
+                        
+                        for field_name in ['client_id', 'clientId']:
+                            try:
+                                query = self.property_files_collection.where(
+                                    filter=FieldFilter(field_name, 'in', chunk_client_ids)
+                                )
+                                for pf_doc in query.stream():
+                                    pf_data = pf_doc.to_dict()
+                                    pf_data['id'] = pf_doc.id
+                                    add_property_file(pf_data)
+                            except Exception as e:
+                                error_str = str(e).lower()
+                                if 'index' in error_str or '400' in error_str:
+                                    logger.warning(f"Index not available for property_files batch query on {field_name} (non-fatal): {e}")
+                                else:
+                                    logger.warning(f"Error fetching property files batch on {field_name}: {e}")
                     
                     # Fix data consistency: Check for clients with no property files found
                     # and try to find property files by client_full_name as fallback
@@ -2132,7 +2550,11 @@ class FirestoreService:
                                     for doc in docs:
                                         pf_data = doc.to_dict()
                                         pf_data['id'] = doc.id
+                                        pf_data = self._normalize_property_file_links(pf_data, expected_client_id=client_id)
                                         pf_client_id = pf_data.get('client_id')
+                                        
+                                        if pf_data.get('id') in seen_property_file_ids:
+                                            continue
                                         
                                         # If this property file has wrong or missing client_id, fix it
                                         if pf_client_id != client_id:
@@ -2147,6 +2569,8 @@ class FirestoreService:
                                         if client_id not in property_files_by_client:
                                             property_files_by_client[client_id] = []
                                         property_files_by_client[client_id].append(pf_data)
+                                        if pf_data.get('id'):
+                                            seen_property_file_ids.add(pf_data['id'])
                                 except Exception as e:
                                     # Handle index errors gracefully - log as warning, not error
                                     error_str = str(e).lower()
@@ -2170,7 +2594,7 @@ class FirestoreService:
             for client_id in client_ids:
                 if client_id in property_files_by_client:
                     for pf in property_files_by_client[client_id]:
-                        property_id = pf.get('property_id')
+                        property_id = pf.get('property_id') or pf.get('propertyId')
                         if property_id:
                             all_property_ids.add(property_id)
                             if property_id not in property_id_to_client_map:
@@ -2349,11 +2773,45 @@ class FirestoreService:
             return False
     
     def delete_agent(self, agent_id: str) -> bool:
-        """Delete an agent record"""
+        """Delete an agent and cascade delete related data (properties, clients, property files, documents)."""
         try:
+            # Delete properties owned by agent (cascades property files and documents)
+            properties_query = self.properties_collection.where(
+                filter=FieldFilter('agentId', '==', agent_id)
+            )
+            properties = list(properties_query.stream())
+            for prop in properties:
+                self.delete_property(prop.id)
+
+            # Delete property files explicitly tied to agent (if any)
+            try:
+                pf_query = self.property_files_collection.where(
+                    filter=FieldFilter('agent_id', '==', agent_id)
+                )
+                for pf_doc in pf_query.stream():
+                    self.delete_property_file(pf_doc.id)
+            except Exception as e:
+                logger.warning(f"Failed to delete agent-linked property files for {agent_id}: {e}")
+
+            # Delete clients assigned to this agent (cascades documents/property files)
+            try:
+                clients_query = self.clients_collection.where(
+                    filter=FieldFilter('agent_id', '==', agent_id)
+                )
+                for client_doc in clients_query.stream():
+                    self.delete_client(client_doc.id)
+            except Exception as e:
+                logger.warning(f"Failed to delete clients for agent {agent_id}: {e}")
+
+            # Delete documents referencing this agent directly
+            deleted_docs = 0
+            deleted_docs += self._delete_documents_by_field('agentId', agent_id)
+            deleted_docs += self._delete_documents_by_field('agent_id', agent_id)
+
+            # Finally delete the agent record
             doc_ref = self.agents_collection.document(agent_id)
             doc_ref.delete()
-            logger.info(f"Deleted agent record: {agent_id}")
+            logger.info(f"Deleted agent record: {agent_id} (documents={deleted_docs}, properties={len(properties)})")
             return True
         except Exception as e:
             logger.error(f"Failed to delete agent record: {e}")
@@ -2760,4 +3218,3 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Failed to find or create deal: {e}")
             return None
-

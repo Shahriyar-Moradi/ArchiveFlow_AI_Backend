@@ -9,7 +9,7 @@ import json
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import base64
 import uuid
 from contextlib import asynccontextmanager
@@ -25,6 +25,21 @@ from time import time
 from urllib.parse import unquote
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Body, Form, Depends, status, Request, Query
+try:
+    import websockets.exceptions
+    # Define exception classes for websocket errors
+    WebSocketConnectionClosed = (
+        websockets.exceptions.ConnectionClosedError 
+        if hasattr(websockets.exceptions, 'ConnectionClosedError') 
+        else Exception
+    )
+    WebSocketConnectionClosedBase = (
+        getattr(websockets.exceptions, 'ConnectionClosed', None) or WebSocketConnectionClosed
+    )
+except (ImportError, AttributeError):
+    # Fallback if websockets.exceptions is not available
+    WebSocketConnectionClosed = RuntimeError
+    WebSocketConnectionClosedBase = RuntimeError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response
 from google.cloud.firestore import FieldFilter
@@ -269,6 +284,24 @@ def convert_decimals(obj):
     return obj
 
 
+async def run_blocking_with_timeout(
+    func,
+    *args,
+    timeout: float = 5.0,
+    fallback=None,
+    description: str = "operation"
+):
+    """Run blocking work in a thread with a timeout to avoid stalling the event loop."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"{description} timed out after {timeout:.1f}s")
+        return fallback
+    except Exception as e:
+        logger.warning(f"{description} failed: {e}")
+        return fallback
+
+
 def parse_organized_path(organized_path: str) -> Dict[str, str]:
     """
     Parse organized_vouchers path structure into components.
@@ -359,14 +392,35 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        try:
+            if websocket in self.active_connections:
+                self.active_connections.remove(websocket)
+        except (ValueError, KeyError):
+            # Connection already removed, ignore
+            pass
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
+        try:
+            await websocket.send_text(message)
+        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, RuntimeError) as e:
+            # Connection closed, remove it from active connections
+            logger.debug(f"WebSocket connection closed while sending message: {e}")
+            self.disconnect(websocket)
+            raise
 
     async def broadcast(self, message: str):
+        disconnected = []
         for connection in self.active_connections:
-            await connection.send_text(message)
+            try:
+                await connection.send_text(message)
+            except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, RuntimeError) as e:
+                # Connection closed, mark for removal
+                logger.debug(f"WebSocket connection closed during broadcast: {e}")
+                disconnected.append(connection)
+        
+        # Remove disconnected connections
+        for connection in disconnected:
+            self.disconnect(connection)
 
 manager = ConnectionManager()
 
@@ -408,6 +462,20 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except HTTPException:
         # Re-raise HTTPException (will be handled by exception handler with CORS)
         raise
+
+def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Return user if token is present/valid; otherwise return empty dict without failing the request."""
+    try:
+        if not credentials or not credentials.credentials:
+            return {}
+        token = credentials.credentials
+        result = simple_auth.get_user(token)
+        if result and result.get("success") and result.get("user"):
+            return result["user"]
+        return {}
+    except Exception:
+        # Fail open for optional auth – callers can still proceed without a user
+        return {}
     except Exception as e:
         # Catch any other exceptions and wrap in HTTPException with CORS
         logger.error(f"Authentication error: {str(e)}", exc_info=True)
@@ -996,7 +1064,7 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
             logger.info(f"Image with hash {image_hash[:8]}... already processed, skipping OCR")
             result.success = False
             doc_no = duplicate_info.get('document_no', 'N/A')
-            result.error = f"Duplicate document. This voucher was already saved as '{doc_no}'."
+            result.error = f"Duplicate document. This document was already saved as '{doc_no}'."
             
             # Populate result with original document info
             result.document_no = doc_no
@@ -1074,7 +1142,7 @@ async def process_single_document(doc_data: Dict[str, Any]) -> ProcessingResult:
                     if existing_docs:
                         logger.warning(f"⚠️ Document number {result.document_no} already exists in Firestore.")
                         result.success = False
-                        result.error = f"Duplicate document number. A voucher with number '{result.document_no}' already exists."
+                        result.error = f"Duplicate document number. A document with number '{result.document_no}' already exists."
                         return result
                 except Exception as e:
                     logger.warning(f"Failed to check document number uniqueness in Firestore: {e}")
@@ -1861,9 +1929,35 @@ async def aws_batch_upload(
                 logger.error(f"❌ [BATCH UPLOAD] Failed to upload file {idx}/{len(files)}: {file.filename} - Error: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
+                
+                # Still create Firestore document for failed uploads so they're tracked
+                document_id = str(uuid.uuid4())
+                error_msg = str(e)
+                
+                if firestore_service:
+                    try:
+                        document_data = {
+                            'filename': file.filename,
+                            'flow_id': flow_id,
+                            'job_id': job_id,
+                            'processing_status': 'failed',
+                            'error': error_msg,
+                            'file_size': 0  # Unknown since upload failed
+                        }
+                        if agent_id:
+                            document_data['agentId'] = agent_id
+                        
+                        firestore_service.create_document(document_id, document_data)
+                        logger.info(f"📝 [BATCH UPLOAD] Created failed document record - document_id: {document_id}, filename: {file.filename}")
+                    except Exception as firestore_error:
+                        logger.error(f"❌ [BATCH UPLOAD] Failed to create Firestore document for failed upload: {firestore_error}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                
                 failed.append({
                     "filename": file.filename,
-                    "error": str(e)
+                    "error": error_msg,
+                    "document_id": document_id
                 })
         
         logger.info(f"📊 [BATCH UPLOAD] Batch upload complete - flow_id: {flow_id}, total: {len(files)}, uploaded: {len(uploaded)}, failed: {len(failed)}")
@@ -2209,7 +2303,7 @@ async def get_gcs_flow_files(flow_id: str):
                 if task_queue and s3_service:
                     stuck_docs_to_process = []
                     stuck_docs_without_path = []
-                    current_time = datetime.now()
+                    current_time = datetime.now(timezone.utc)
                     
                     for doc in firestore_docs:
                         doc_id = doc.get('document_id') or doc.get('id', '')
@@ -2221,11 +2315,20 @@ async def get_gcs_flow_files(flow_id: str):
                         # Calculate how long the document has been stuck
                         stuck_duration = None
                         if created_at:
-                            if isinstance(created_at, datetime):
-                                stuck_duration = (current_time - created_at).total_seconds()
-                            elif hasattr(created_at, 'isoformat'):
-                                # Firestore timestamp
-                                stuck_duration = (current_time - created_at).total_seconds() if hasattr(created_at, 'timestamp') else None
+                            try:
+                                if isinstance(created_at, datetime):
+                                    created_dt = created_at
+                                elif hasattr(created_at, 'to_datetime'):
+                                    created_dt = created_at.to_datetime()
+                                else:
+                                    created_dt = None
+                                
+                                if created_dt:
+                                    if created_dt.tzinfo is None:
+                                        created_dt = created_dt.replace(tzinfo=timezone.utc)
+                                    stuck_duration = (current_time - created_dt).total_seconds()
+                            except Exception as ts_error:
+                                logger.warning(f"⚠️  [AUTO-RECOVERY] Could not parse created_at for doc {doc_id}: {ts_error}")
                         
                         # Handle documents stuck in 'uploading', 'pending', or 'uploaded' status
                         # Only recover documents that have been stuck for at least 30 seconds to avoid interfering with active uploads
@@ -2451,11 +2554,87 @@ async def get_gcs_flow_files(flow_id: str):
             else:
                 pending_files.append(file_data)
                 logger.debug(f"⏳ [FLOW FILES] Added to pending_files (default) - document_id: {document_id}, filename: {filename}, status: {status}")
+
+        # Get current storage view so we can backfill files that are missing in Firestore
+        gcs_result = None
+        if s3_service:
+            try:
+                gcs_result = s3_service.get_flow_files_from_s3(flow_id)
+            except Exception as gcs_list_error:
+                logger.warning(f"⚠️  [FLOW FILES] Could not list flow files from storage for reconciliation: {gcs_list_error}")
+
+        # If storage shows files that aren't in Firestore, add them so UI counts stay correct
+        if firestore_documents and gcs_result and gcs_result.get('success'):
+            existing_keys = set()
+            for collection in (temp_files, organized_files, failed_files, pending_files, need_review_files):
+                for f in collection:
+                    key = f.get('s3_key') or extract_gcs_key_from_path(f.get('organized_path', ''), s3_service.bucket_name)
+                    if key:
+                        existing_keys.add(key)
+
+            added_from_gcs = 0
+
+            # Add temp (pending) files that aren't represented in Firestore
+            for file in gcs_result.get('temp_files', []):
+                key = file.get('key', '')
+                if key and key not in existing_keys:
+                    pending_files.append({
+                        'filename': key.split('/')[-1],
+                        's3_key': key,
+                        'size': file.get('size', 0),
+                        'uploaded_at': file.get('last_modified', ''),
+                        'last_modified': file.get('last_modified', ''),
+                        'status': 'uploaded',
+                        'url': file.get('url', '')
+                    })
+                    existing_keys.add(key)
+                    added_from_gcs += 1
+
+            # Add organized files that don't have Firestore rows (processed but missing metadata)
+            for file in gcs_result.get('organized_files', []):
+                key = file.get('key', '')
+                if key and key not in existing_keys:
+                    path_parts = parse_organized_path(key)
+                    organized_files.append({
+                        'filename': path_parts.get('filename', key.split('/')[-1]),
+                        's3_key': key,
+                        'organized_path': '/'.join(key.split('/')[:-1]) if '/' in key else '',
+                        'category': path_parts.get('category', ''),
+                        'year': path_parts.get('year', ''),
+                        'month': path_parts.get('month', ''),
+                        'date': path_parts.get('date', ''),
+                        'size': file.get('size', 0),
+                        'processed_at': file.get('last_modified', ''),
+                        'status': 'processed',
+                        'url': file.get('url', '')
+                    })
+                    existing_keys.add(key)
+                    added_from_gcs += 1
+
+            # Add failed files that aren't tracked in Firestore
+            for file in gcs_result.get('failed_files', []):
+                key = file.get('key', '')
+                if key and key not in existing_keys:
+                    failed_files.append({
+                        'filename': key.split('/')[-1],
+                        's3_key': key,
+                        'size': file.get('size', 0),
+                        'uploaded_at': file.get('last_modified', ''),
+                        'status': 'failed',
+                        'url': file.get('url', '')
+                    })
+                    existing_keys.add(key)
+                    added_from_gcs += 1
+
+            if added_from_gcs:
+                storage_total = gcs_result.get('total_files', len(existing_keys))
+                logger.warning(f"⚠️  [FLOW FILES] Added {added_from_gcs} file(s) from storage that were missing in Firestore (firestore={len(processed_docs)}, storage_total={storage_total})")
         
         # FALLBACK: Query GCS if Firestore has no documents (lazy migration scenario)
         if not firestore_documents:
             logger.warning(f"⚠️  No Firestore documents found for flow {flow_id}, falling back to GCS listing")
-            gcs_result = s3_service.get_flow_files_from_s3(flow_id)
+            if not gcs_result:
+                gcs_result = s3_service.get_flow_files_from_s3(flow_id)
             
             if gcs_result.get('success'):
                 # Process GCS temp files
@@ -2509,14 +2688,10 @@ async def get_gcs_flow_files(flow_id: str):
         total_from_firestore = len(firestore_documents)
         total_from_categorized = len(temp_files) + len(organized_files) + len(failed_files) + len(pending_files) + len(need_review_files)
         
-        # Use Firestore count as primary, but ensure categorized count matches
-        # If they don't match, log a warning and use the larger count to ensure nothing is missed
-        total = total_from_firestore
+        # Use the larger of categorized files and Firestore rows so missing storage files are still reflected in the UI
+        total = max(total_from_categorized, total_from_firestore)
         if total_from_firestore != total_from_categorized:
-            logger.warning(f"⚠️  [FLOW FILES] Document count mismatch for flow {flow_id}: Firestore={total_from_firestore}, Categorized={total_from_categorized}")
-            logger.warning(f"⚠️  [FLOW FILES] Using Firestore count ({total_from_firestore}) as source of truth")
-            # Use the larger count to ensure we don't miss any documents
-            total = max(total_from_firestore, total_from_categorized)
+            logger.warning(f"⚠️  [FLOW FILES] Document count mismatch for flow {flow_id}: Firestore={total_from_firestore}, Categorized={total_from_categorized}. Using total={total}")
         
         organized_count = len(organized_files)
         pending_count = len(temp_files) + len(pending_files)
@@ -3164,7 +3339,7 @@ async def create_document_metadata(
     propertyId: Optional[str] = Body(None),
     clientId: Optional[str] = Body(None),
     documentType: Optional[str] = Body(None),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_optional_user)
 ):
     """
     Create document metadata in Firestore and return signed URL for direct GCS upload.
@@ -3183,13 +3358,12 @@ async def create_document_metadata(
             logger.error(f"❌ [UPLOAD STEP 1] GCS service not available for flow_id: {flow_id}, filename: {filename}")
             check_gcs_available()
         
-        # Extract agentId from current user
-        agent_id = current_user.get('id')
-        if not agent_id:
-            logger.error(f"❌ [UPLOAD STEP 1] User not authenticated for flow_id: {flow_id}, filename: {filename}")
-            raise HTTPException(status_code=401, detail="User not authenticated")
-        
-        logger.info(f"✅ [UPLOAD STEP 1] User authenticated - agent_id: {agent_id}, flow_id: {flow_id}, filename: {filename}")
+        # Extract agentId from current user (optional)
+        agent_id = current_user.get('id') if current_user else None
+        if agent_id:
+            logger.info(f"✅ [UPLOAD STEP 1] User authenticated - agent_id: {agent_id}, flow_id: {flow_id}, filename: {filename}")
+        else:
+            logger.info(f"ℹ️  [UPLOAD STEP 1] Proceeding without authenticated user for flow_id: {flow_id}, filename: {filename}")
         
         # Ensure flow exists in Firestore
         _ensure_flow_exists(flow_id, flow_name)
@@ -3216,8 +3390,11 @@ async def create_document_metadata(
             'content_type': content_type,
             'processing_status': 'uploading',  # Document is being uploaded
             'source': 'web_upload',
-            'agentId': agent_id,  # Agent who uploaded the document
         }
+        
+        # Only add agentId when available
+        if agent_id:
+            document_data['agentId'] = agent_id  # Agent who uploaded the document
         
         # Add optional relationships
         if propertyId:
@@ -3377,16 +3554,32 @@ async def complete_document_upload(
         # Queue background processing task (OCR, classification, etc.)
         if task_queue:
             logger.info(f"🔄 [UPLOAD STEP 3] Queuing background processing task - document_id: {document_id}, flow_id: {flow_id}, filename: {filename}")
-            task_queue.add_process_task(
-                background_tasks,
-                document_id,
-                gcs_temp_path,
-                filename,
-                job_id
-            )
-            logger.info(f"✅ [UPLOAD STEP 3] Queued background processing task for document {document_id} (flow_id: {flow_id}, filename: {filename})")
+            try:
+                task_queue.add_process_task(
+                    background_tasks,
+                    document_id,
+                    gcs_temp_path,
+                    filename,
+                    job_id
+                )
+                logger.info(f"✅ [UPLOAD STEP 3] Queued background processing task for document {document_id} (flow_id: {flow_id}, filename: {filename})")
+            except Exception as queue_error:
+                logger.error(f"❌ [UPLOAD STEP 3] Failed to queue processing task for document {document_id}: {queue_error}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Don't fail the request - file is uploaded, processing can be retried
+                # The auto-recovery mechanism will pick it up
         else:
             logger.warning(f"⚠️  [UPLOAD STEP 3] Task queue not available - background processing not queued for document_id: {document_id}, flow_id: {flow_id}")
+            # Mark document as needing processing so auto-recovery can pick it up
+            try:
+                firestore_service.update_document(document_id, {
+                    'processing_status': 'uploaded',  # Keep as uploaded so auto-recovery can process it
+                    'needs_processing': True  # Flag for auto-recovery
+                })
+                logger.info(f"📝 [UPLOAD STEP 3] Marked document {document_id} as needing processing (task queue unavailable)")
+            except Exception as update_error:
+                logger.error(f"❌ [UPLOAD STEP 3] Failed to mark document {document_id} as needing processing: {update_error}")
         
         # Invalidate caches
         if flow_id and f"flow_files_{flow_id}" in _flow_files_cache:
@@ -3413,17 +3606,19 @@ async def complete_document_upload(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/gcs/upload-files")
+@app.post("/api/gcs/batch-upload")  # Backward-compatible alias for existing frontend calls
 async def gcs_upload_files(
     files: List[UploadFile] = File(...), 
     flow_id: Optional[str] = Form(None),
     flow_name: Optional[str] = Form(None),
+    batch_id: Optional[str] = Form(None),  # Accept legacy form field name
     background_tasks: BackgroundTasks = BackgroundTasks(),
     request: Request = None
 ):
     """
     Upload one or many files to GCS and run inline OCR. Accepts multipart/form-data.
     """
-    logger.info(f"📦 [GCS BATCH UPLOAD] Starting GCS batch upload - {len(files)} file(s), flow_id: {flow_id}, flow_name: {flow_name}")
+    logger.info(f"📦 [GCS BATCH UPLOAD] Starting GCS batch upload - {len(files)} file(s), flow_id: {flow_id}, batch_id: {batch_id}, flow_name: {flow_name}")
     if not files:
         logger.error(f"❌ [GCS BATCH UPLOAD] No files provided")
         return JSONResponse(content={"success": False, "error": "No files provided"}, status_code=400)
@@ -3444,12 +3639,14 @@ async def gcs_upload_files(
     except Exception as e:
         logger.debug(f"⚠️  [GCS BATCH UPLOAD] Could not extract agent ID from request: {e}")
 
-    # Ensure flow_id exists if provided; otherwise generate one
-    final_flow_id = flow_id or f"flow-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    if not flow_id:
-        logger.info(f"🆕 [GCS BATCH UPLOAD] Generated new flow_id: {final_flow_id}")
-    else:
+    # Support both flow_id and legacy batch_id field names from the frontend
+    final_flow_id = flow_id or batch_id or f"flow-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if flow_id:
         logger.info(f"📂 [GCS BATCH UPLOAD] Using provided flow_id: {final_flow_id}")
+    elif batch_id:
+        logger.info(f"📂 [GCS BATCH UPLOAD] Using provided batch_id as flow_id: {final_flow_id}")
+    else:
+        logger.info(f"🆕 [GCS BATCH UPLOAD] Generated new flow_id: {final_flow_id}")
     
     # Ensure flow exists in Firestore before uploading documents
     # Use provided flow_name if available, otherwise it will default to "Uploaded Flow"
@@ -3478,41 +3675,88 @@ async def gcs_upload_files(
     failed = []
     ocr_results = []
 
-    # PERFORMANCE: Process files in parallel instead of sequentially
-    async def process_single_file(file: UploadFile) -> tuple[dict, bool]:
-        """Process a single file upload"""
-        logger.info(f"📄 [GCS BATCH UPLOAD] Processing file: {file.filename} (flow_id: {final_flow_id})")
+    # Read all file contents sequentially before parallel processing
+    # UploadFile streams can only be read once, so we must read them sequentially
+    # before processing them in parallel
+    logger.info(f"📖 [GCS BATCH UPLOAD] Reading {len(files)} file(s) sequentially before parallel processing - flow_id: {final_flow_id}")
+    file_data_list = []
+    for idx, file in enumerate(files, 1):
         try:
             content = await file.read()
             file_type = file.filename.split(".")[-1].lower() if "." in file.filename else "jpg"
-            logger.info(f"📊 [GCS BATCH UPLOAD] Read file content - filename: {file.filename}, size: {len(content)} bytes, type: {file_type}")
+            file_data_list.append({
+                'filename': file.filename,
+                'content': content,
+                'file_type': file_type,
+                'content_type': file.content_type or 'application/octet-stream',
+                'file_size': len(content)
+            })
+            logger.info(f"✅ [GCS BATCH UPLOAD] Read file {idx}/{len(files)}: {file.filename}, size: {len(content)} bytes")
+        except Exception as e:
+            logger.error(f"❌ [GCS BATCH UPLOAD] Failed to read file {idx}/{len(files)}: {file.filename} - Error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Create failed document record
+            if firestore_service:
+                try:
+                    failed_document_id = f"{final_flow_id}_{file.filename}_{uuid.uuid4().hex[:6]}"
+                    failed_document_data = {
+                        'filename': file.filename,
+                        'flow_id': final_flow_id,
+                        'processing_status': 'failed',
+                        'error': f"Failed to read file: {str(e)}",
+                        'file_size': 0,
+                        'source': 'web_upload'
+                    }
+                    if agent_id:
+                        failed_document_data['agentId'] = agent_id
+                    firestore_service.create_document(failed_document_id, failed_document_data)
+                    logger.info(f"📝 [GCS BATCH UPLOAD] Created failed document record - document_id: {failed_document_id}, filename: {file.filename}")
+                except Exception as firestore_error:
+                    logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create Firestore document for failed read: {firestore_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            failed.append({"filename": file.filename, "error": f"Failed to read file: {str(e)}"})
 
-            logger.info(f"☁️  [GCS BATCH UPLOAD] Uploading to GCS temp - filename: {file.filename}, flow_id: {final_flow_id}")
+    logger.info(f"✅ [GCS BATCH UPLOAD] Finished reading {len(file_data_list)} file(s) - flow_id: {final_flow_id}")
+
+    # PERFORMANCE: Process files in parallel instead of sequentially
+    async def process_single_file(file_data: dict) -> tuple[dict, bool]:
+        """Process a single file upload using pre-read content"""
+        filename = file_data['filename']
+        content = file_data['content']
+        file_type = file_data['file_type']
+        
+        logger.info(f"📄 [GCS BATCH UPLOAD] Processing file: {filename} (flow_id: {final_flow_id})")
+        try:
+            logger.info(f"📊 [GCS BATCH UPLOAD] Processing file content - filename: {filename}, size: {len(content)} bytes, type: {file_type}")
+
+            logger.info(f"☁️  [GCS BATCH UPLOAD] Uploading to GCS temp - filename: {filename}, flow_id: {final_flow_id}")
             upload_res = await s3_service.upload_image_to_temp(
                 image_data=content,
-                filename=file.filename,
+                filename=filename,
                 file_type=file_type,
                 flow_id=final_flow_id,
             )
 
             if upload_res.get("success"):
                 gcs_temp_path = upload_res.get('s3_key')
-                logger.info(f"✅ [GCS BATCH UPLOAD] Upload reported success - filename: {file.filename}, gcs_path: {gcs_temp_path}")
+                logger.info(f"✅ [GCS BATCH UPLOAD] Upload reported success - filename: {filename}, gcs_path: {gcs_temp_path}")
                 
                 # Verify the file was actually saved to GCS before creating Firestore record
-                logger.info(f"🔍 [GCS BATCH UPLOAD] Verifying file exists in GCS - path: {gcs_temp_path}, filename: {file.filename}")
+                logger.info(f"🔍 [GCS BATCH UPLOAD] Verifying file exists in GCS - path: {gcs_temp_path}, filename: {filename}")
                 if gcs_temp_path and await s3_service.check_file_exists(gcs_temp_path):
-                    logger.info(f"✅ [GCS BATCH UPLOAD] Verified file exists in GCS: {gcs_temp_path}, filename: {file.filename}")
+                    logger.info(f"✅ [GCS BATCH UPLOAD] Verified file exists in GCS: {gcs_temp_path}, filename: {filename}")
                     
                     # Create document record in Firestore and trigger background processing
                     if firestore_service and task_queue:
                         try:
-                            document_id = f"{final_flow_id}_{file.filename}_{uuid.uuid4().hex[:6]}"
-                            logger.info(f"🆔 [GCS BATCH UPLOAD] Generated document_id: {document_id} for filename: {file.filename}")
+                            document_id = f"{final_flow_id}_{filename}_{uuid.uuid4().hex[:6]}"
+                            logger.info(f"🆔 [GCS BATCH UPLOAD] Generated document_id: {document_id} for filename: {filename}")
                             
                             # Create document record
                             document_data = {
-                                'filename': file.filename,
+                                'filename': filename,
                                 'flow_id': final_flow_id,
                                 'gcs_temp_path': gcs_temp_path,
                                 'file_size': upload_res.get('size', 0),
@@ -3522,48 +3766,134 @@ async def gcs_upload_files(
                             if agent_id:
                                 document_data['agentId'] = agent_id
                             
-                            logger.info(f"💾 [GCS BATCH UPLOAD] Creating document record - document_id: {document_id}, filename: {file.filename}, flow_id: {final_flow_id}")
+                            logger.info(f"💾 [GCS BATCH UPLOAD] Creating document record - document_id: {document_id}, filename: {filename}, flow_id: {final_flow_id}")
                             firestore_service.create_document(document_id, document_data)
-                            logger.info(f"✅ [GCS BATCH UPLOAD] Created document record: {document_id} with gcs_temp_path: {gcs_temp_path}, filename: {file.filename}")
+                            logger.info(f"✅ [GCS BATCH UPLOAD] Created document record: {document_id} with gcs_temp_path: {gcs_temp_path}, filename: {filename}")
                             
                             # Add background processing task
-                            logger.info(f"🔄 [GCS BATCH UPLOAD] Queuing background processing task - document_id: {document_id}, filename: {file.filename}")
+                            logger.info(f"🔄 [GCS BATCH UPLOAD] Queuing background processing task - document_id: {document_id}, filename: {filename}")
                             task_queue.add_process_task(
                                 background_tasks,
                                 document_id,
                                 gcs_temp_path,
-                                file.filename,
+                                filename,
                                 job_id
                             )
-                            logger.info(f"✅ [GCS BATCH UPLOAD] Added processing task for: {file.filename} (document_id: {document_id})")
+                            logger.info(f"✅ [GCS BATCH UPLOAD] Added processing task for: {filename} (document_id: {document_id})")
                         except Exception as e:
-                            logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create document or add task for {file.filename}: {e}")
+                            logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create document or add task for {filename}: {e}")
                             import traceback
                             logger.error(traceback.format_exc())
-                            return ({"filename": file.filename, "error": str(e)}, False)
+                            
+                            # Create Firestore document for failed upload so it's tracked
+                            if firestore_service:
+                                try:
+                                    failed_document_id = f"{final_flow_id}_{filename}_{uuid.uuid4().hex[:6]}"
+                                    failed_document_data = {
+                                        'filename': filename,
+                                        'flow_id': final_flow_id,
+                                        'processing_status': 'failed',
+                                        'error': str(e),
+                                        'file_size': upload_res.get('size', 0) if upload_res else 0,
+                                        'source': 'web_upload'
+                                    }
+                                    if agent_id:
+                                        failed_document_data['agentId'] = agent_id
+                                    
+                                    firestore_service.create_document(failed_document_id, failed_document_data)
+                                    logger.info(f"📝 [GCS BATCH UPLOAD] Created failed document record - document_id: {failed_document_id}, filename: {filename}")
+                                except Exception as firestore_error:
+                                    logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create Firestore document for failed upload: {firestore_error}")
+                            
+                            return ({"filename": filename, "error": str(e)}, False)
                     else:
-                        logger.warning(f"⚠️  [GCS BATCH UPLOAD] Firestore service or task queue not available - filename: {file.filename}")
+                        logger.warning(f"⚠️  [GCS BATCH UPLOAD] Firestore service or task queue not available - filename: {filename}")
                     
-                    logger.info(f"✅ [GCS BATCH UPLOAD] Successfully processed file: {file.filename} (document_id: {document_id if firestore_service else 'N/A'})")
+                    logger.info(f"✅ [GCS BATCH UPLOAD] Successfully processed file: {filename} (document_id: {document_id if firestore_service else 'N/A'})")
                     return (upload_res, True)
                 else:
                     # File upload reported success but file doesn't exist in GCS
                     error_msg = f"File upload reported success but file not found in GCS: {gcs_temp_path}"
-                    logger.error(f"❌ [GCS BATCH UPLOAD] {error_msg} - filename: {file.filename}, flow_id: {final_flow_id}")
-                    return ({"filename": file.filename, "error": error_msg}, False)
+                    logger.error(f"❌ [GCS BATCH UPLOAD] {error_msg} - filename: {filename}, flow_id: {final_flow_id}")
+                    
+                    # Create Firestore document for failed upload so it's tracked
+                    if firestore_service:
+                        try:
+                            failed_document_id = f"{final_flow_id}_{filename}_{uuid.uuid4().hex[:6]}"
+                            failed_document_data = {
+                                'filename': filename,
+                                'flow_id': final_flow_id,
+                                'processing_status': 'failed',
+                                'error': error_msg,
+                                'file_size': upload_res.get('size', 0) if upload_res else 0,
+                                'source': 'web_upload'
+                            }
+                            if agent_id:
+                                failed_document_data['agentId'] = agent_id
+                            
+                            firestore_service.create_document(failed_document_id, failed_document_data)
+                            logger.info(f"📝 [GCS BATCH UPLOAD] Created failed document record - document_id: {failed_document_id}, filename: {filename}")
+                        except Exception as firestore_error:
+                            logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create Firestore document for failed upload: {firestore_error}")
+                    
+                    return ({"filename": filename, "error": error_msg}, False)
             else:
                 error_msg = upload_res.get("error", "Unknown error")
-                logger.error(f"❌ [GCS BATCH UPLOAD] Upload failed - filename: {file.filename}, error: {error_msg}")
-                return ({"filename": file.filename, "error": error_msg}, False)
+                logger.error(f"❌ [GCS BATCH UPLOAD] Upload failed - filename: {filename}, error: {error_msg}")
+                
+                # Create Firestore document for failed upload so it's tracked
+                if firestore_service:
+                    try:
+                        failed_document_id = f"{final_flow_id}_{filename}_{uuid.uuid4().hex[:6]}"
+                        failed_document_data = {
+                            'filename': filename,
+                            'flow_id': final_flow_id,
+                            'processing_status': 'failed',
+                            'error': error_msg,
+                            'file_size': 0,
+                            'source': 'web_upload'
+                        }
+                        if agent_id:
+                            failed_document_data['agentId'] = agent_id
+                        
+                        firestore_service.create_document(failed_document_id, failed_document_data)
+                        logger.info(f"📝 [GCS BATCH UPLOAD] Created failed document record - document_id: {failed_document_id}, filename: {filename}")
+                    except Exception as firestore_error:
+                        logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create Firestore document for failed upload: {firestore_error}")
+                
+                return ({"filename": filename, "error": error_msg}, False)
         except Exception as e:
-            logger.error(f"❌ [GCS BATCH UPLOAD] Error processing file {file.filename}: {e}")
+            logger.error(f"❌ [GCS BATCH UPLOAD] Error processing file {filename}: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return ({"filename": file.filename, "error": str(e)}, False)
+            
+            # Create Firestore document for failed upload so it's tracked
+            if firestore_service:
+                try:
+                    failed_document_id = f"{final_flow_id}_{filename}_{uuid.uuid4().hex[:6]}"
+                    failed_document_data = {
+                        'filename': filename,
+                        'flow_id': final_flow_id,
+                        'processing_status': 'failed',
+                        'error': str(e),
+                        'file_size': 0,
+                        'source': 'web_upload'
+                    }
+                    if agent_id:
+                        failed_document_data['agentId'] = agent_id
+                    
+                    firestore_service.create_document(failed_document_id, failed_document_data)
+                    logger.info(f"📝 [GCS BATCH UPLOAD] Created failed document record - document_id: {failed_document_id}, filename: {filename}")
+                except Exception as firestore_error:
+                    logger.error(f"❌ [GCS BATCH UPLOAD] Failed to create Firestore document for failed upload: {firestore_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            
+            return ({"filename": filename, "error": str(e)}, False)
     
-    # Process all files in parallel
-    logger.info(f"🔄 [GCS BATCH UPLOAD] Processing {len(files)} file(s) in parallel - flow_id: {final_flow_id}")
-    results = await asyncio.gather(*[process_single_file(file) for file in files], return_exceptions=True)
+    # Process all files in parallel (using pre-read content)
+    logger.info(f"🔄 [GCS BATCH UPLOAD] Processing {len(file_data_list)} file(s) in parallel - flow_id: {final_flow_id}")
+    results = await asyncio.gather(*[process_single_file(file_data) for file_data in file_data_list], return_exceptions=True)
     logger.info(f"✅ [GCS BATCH UPLOAD] All files processed - flow_id: {final_flow_id}, results: {len(results)}")
     
     # Track document IDs for batch matching
@@ -3888,9 +4218,20 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # Handle ping/pong
             if data == "ping":
-                await websocket.send_text("pong")
+                try:
+                    await websocket.send_text("pong")
+                except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, RuntimeError) as e:
+                    # Connection closed while sending pong, break the loop
+                    logger.debug(f"WebSocket connection closed while sending pong: {e}")
+                    break
     
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, RuntimeError, asyncio.CancelledError) as e:
+        # Connection closed or cancelled (e.g., during server reload)
+        logger.debug(f"WebSocket connection closed: {type(e).__name__}: {e}")
+        manager.disconnect(websocket)
+    except Exception as e:
+        # Unexpected error, log it and disconnect
+        logger.error(f"Unexpected error in websocket_endpoint: {type(e).__name__}: {e}", exc_info=True)
         manager.disconnect(websocket)
 
 @app.get("/api/document/{document_id:path}/status")
@@ -4355,8 +4696,9 @@ async def get_document_processing_status(document_id: str):
             return JSONResponse(content={
                 "success": False,
                 "document_id": document_id,
-                "message": "Document not found in Firestore"
-            }, status_code=404)
+                "message": "Document not found in Firestore",
+                "status": "not_found"
+            })
     except Exception as e:
         logger.error(f"Failed to get document status: {e}")
         import traceback
@@ -6850,6 +7192,10 @@ async def delete_client(client_id: str):
         success = firestore_service.delete_client(client_id)
         if not success:
             raise HTTPException(status_code=500, detail="Failed to delete client")
+
+        # Invalidate related caches so analytics and lists stay in sync
+        _clients_cache.clear()
+        _analytics_cache.clear()
         
         return JSONResponse(content={"success": True})
     except HTTPException:
@@ -7098,6 +7444,37 @@ async def get_property(property_id: str):
         logger.error(f"Error getting property: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/api/properties/{property_id}")
+async def delete_property(
+    property_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Delete a property and cascade related records."""
+    check_firestore_available()
+    
+    try:
+        property_obj = firestore_service.get_property(property_id)
+        if not property_obj:
+            raise HTTPException(status_code=404, detail="Property not found")
+
+        # Authorization: admin or owning agent can delete
+        user_is_admin = current_user.get('role') == 'admin' or current_user.get('id') == 'demo_admin_user' or current_user.get('email') == 'admin@example.com'
+        if not user_is_admin and property_obj.get('agentId') != current_user.get('id'):
+            raise HTTPException(status_code=403, detail="You are not allowed to delete this property")
+
+        success = firestore_service.delete_property(property_id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete property")
+
+        _analytics_cache.clear()
+
+        return JSONResponse(content={"success": True})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting property: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/properties/{property_id}/property-files")
 async def get_property_property_files(property_id: str):
     """Get all property files for a property"""
@@ -7209,13 +7586,13 @@ async def get_agent(
     include_stats: bool = Query(True, description="Whether to include stats (properties_count, clients_count, documents_count)")
 ):
     """Get agent details from both auth service and agents collection, with optional stats"""
-    check_firestore_available()
+    firestore_available = firestore_service is not None
     
     try:
+        now = time()
         # Check cache first (only when stats are included, as stats calculation is expensive)
         if include_stats:
             cache_key = f'agent_{agent_id}_stats'
-            now = time()
             if cache_key in _agents_cache:
                 cached_data, cached_time = _agents_cache[cache_key]
                 if now - cached_time < _AGENTS_CACHE_TTL:
@@ -7236,27 +7613,47 @@ async def get_agent(
             logger.warning(f"Error getting agent from auth service: {e}")
         
         # Then, merge with data from agents collection (if exists)
-        try:
-            agent_from_firestore = firestore_service.get_agent(agent_id)
-            if agent_from_firestore:
-                # Merge: agents collection takes precedence for fields that exist
-                agent_dict.update({
-                    k: v for k, v in agent_from_firestore.items() 
-                    if k not in ['id'] or v is not None
-                })
-        except Exception as e:
-            logger.warning(f"Error getting agent from Firestore: {e}")
+        if firestore_available:
+            try:
+                agent_from_firestore = await run_blocking_with_timeout(
+                    firestore_service.get_agent,
+                    agent_id,
+                    timeout=4.0,
+                    fallback=None,
+                    description=f"Fetching agent {agent_id} from Firestore"
+                )
+                if agent_from_firestore:
+                    # Merge: agents collection takes precedence for fields that exist
+                    agent_dict.update({
+                        k: v for k, v in agent_from_firestore.items() 
+                        if k not in ['id'] or v is not None
+                    })
+            except Exception as e:
+                logger.warning(f"Error getting agent from Firestore: {e}")
+        else:
+            logger.warning("Firestore service not available; returning agent without Firestore fields")
         
         if not agent_dict or not agent_dict.get('id'):
             raise HTTPException(status_code=404, detail="Agent not found")
         
         # Calculate stats if requested (using same logic as batch endpoint)
-        if include_stats:
+        if include_stats and firestore_available:
             try:
-                stats = calculate_agent_stats(agent_id)
-                agent_dict['properties_count'] = stats['properties_count']
-                agent_dict['clients_count'] = stats['clients_count']
-                agent_dict['documents_count'] = stats['documents_count']
+                stats = await run_blocking_with_timeout(
+                    calculate_agent_stats,
+                    agent_id,
+                    timeout=6.0,
+                    fallback=None,
+                    description=f"Calculating stats for agent {agent_id}"
+                )
+                if stats:
+                    agent_dict['properties_count'] = stats.get('properties_count', 0)
+                    agent_dict['clients_count'] = stats.get('clients_count', 0)
+                    agent_dict['documents_count'] = stats.get('documents_count', 0)
+                else:
+                    agent_dict['properties_count'] = 0
+                    agent_dict['clients_count'] = 0
+                    agent_dict['documents_count'] = 0
             except Exception as e:
                 logger.warning(f"Error calculating stats for agent {agent_id}: {e}")
                 # Fallback: set stats to 0
@@ -7265,9 +7662,11 @@ async def get_agent(
                 agent_dict['documents_count'] = 0
         else:
             # No stats requested
-            agent_dict['properties_count'] = 0
-            agent_dict['clients_count'] = 0
-            agent_dict['documents_count'] = 0
+            agent_dict.setdefault('properties_count', 0)
+            agent_dict.setdefault('clients_count', 0)
+            agent_dict.setdefault('documents_count', 0)
+            if include_stats and not firestore_available:
+                logger.warning(f"Skipping stats for agent {agent_id} because Firestore is unavailable")
         
         response_data = {
             "success": True,
@@ -7322,6 +7721,11 @@ async def delete_agent(
         success = firestore_service.delete_agent(agent_id)
         if not success:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+        _agents_cache.clear()
+        _clients_cache.clear()
+        _analytics_cache.clear()
+
         return JSONResponse(content={
             "success": True,
             "message": "Agent deleted successfully"
@@ -7662,6 +8066,8 @@ async def delete_property_file(property_file_id: str):
         success = firestore_service.delete_property_file(property_file_id)
         if not success:
             raise HTTPException(status_code=500, detail="Failed to delete property file")
+
+        _analytics_cache.clear()
         
         return JSONResponse(content={"success": True})
     except HTTPException:
@@ -7703,10 +8109,14 @@ async def match_unlinked_documents(request_data: Dict[str, Any] = Body(...)):
             property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
             transaction_type = metadata.get('transaction_type') or 'BUY'
             
+            # For ID documents, use lenient transaction type matching
+            is_id_document = (doc_type_normalized == 'ID')
+            
             matching_files = firestore_service.find_matching_property_file(
                 client_full_name=client_full_name,
                 property_reference=property_reference,
-                transaction_type=transaction_type
+                transaction_type=transaction_type,
+                is_id_document=is_id_document
             )
             
             if matching_files:
@@ -7916,6 +8326,7 @@ async def auto_attach_document(request_data: Dict[str, Any] = Body(...)):
         
         client_full_name = metadata.get('client_full_name_extracted') or metadata.get('client_full_name')
         property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
+        transaction_type = metadata.get('transaction_type') or 'BUY'
         
         if not client_full_name:
             # Mark as unlinked
@@ -7925,10 +8336,15 @@ async def auto_attach_document(request_data: Dict[str, Any] = Body(...)):
                 "message": "Client name not found in document"
             })
         
+        # For ID documents, use lenient transaction type matching
+        is_id_document = (doc_type_normalized == 'ID')
+        
         # Find matching property files
         matching_files = firestore_service.find_matching_property_file(
             client_full_name=client_full_name,
-            property_reference=property_reference
+            property_reference=property_reference,
+            transaction_type=transaction_type,
+            is_id_document=is_id_document
         )
         
         if len(matching_files) == 0:

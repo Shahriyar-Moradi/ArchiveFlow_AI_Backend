@@ -318,25 +318,58 @@ class TaskQueue:
                             self.firestore_service.update_document(document_id, {'metadata': metadata})
                             
                             # Normalize document_type for comparison (handle variations)
-                            doc_type_normalized = document_type.upper().strip() if document_type else ''
+                            # Normalize by removing spaces, underscores, and converting to uppercase
+                            doc_type_normalized = document_type.upper().strip().replace(' ', '_').replace('-', '_') if document_type else ''
+                            # Also create a version with spaces for comparison
+                            doc_type_normalized_spaced = document_type.upper().strip() if document_type else ''
                             
                             # Check if this is one of the 4 property file document types
-                            property_file_doc_types = ['SPA', 'INVOICES', 'INVOICE', 'ID', 'PROOF OF PAYMENT', 'PROOF_OF_PAYMENT']
+                            # Use multiple normalization variants to catch all cases
+                            property_file_doc_types = [
+                                'SPA', 
+                                'INVOICES', 'INVOICE', 
+                                'ID', 
+                                'PROOF OF PAYMENT', 'PROOF_OF_PAYMENT', 'PROOF-OF-PAYMENT',
+                                'PROOFOFPAYMENT'  # No spaces/separators
+                            ]
                             
-                            if doc_type_normalized in property_file_doc_types:
-                                if doc_type_normalized == 'ID':
+                            # Check both normalized versions
+                            is_property_file_type = (
+                                doc_type_normalized in property_file_doc_types or
+                                doc_type_normalized_spaced in property_file_doc_types or
+                                any(dt in doc_type_normalized or dt in doc_type_normalized_spaced for dt in property_file_doc_types)
+                            )
+                            
+                            # Additional check: if document_type contains keywords, treat as property file type
+                            if not is_property_file_type and document_type:
+                                doc_lower = document_type.lower()
+                                if any(keyword in doc_lower for keyword in ['spa', 'invoice', 'id', 'proof', 'payment']):
+                                    logger.info(f"Document type '{document_type}' contains property file keywords - attempting property file matching")
+                                    is_property_file_type = True
+                            
+                            if is_property_file_type:
+                                if doc_type_normalized == 'ID' or 'ID' in doc_type_normalized:
                                     logger.info(f"🆔 ID document {document_id} detected - processing for property file matching/creation")
                                     logger.info(f"📋 ID document {document_id} - Extracted data: client_full_name_extracted={result.get('client_full_name_extracted')}, property_reference_extracted={result.get('property_reference_extracted')}")
                                 else:
-                                    logger.info(f"Property file document type {document_type} detected - finding or creating property file for document {document_id}")
+                                    logger.info(f"✅ Property file document type '{document_type}' (normalized: '{doc_type_normalized}') detected - finding or creating property file for document {document_id}")
+                                
+                                # Validate that we have required data before attempting match
+                                has_client_name = bool(result.get('client_full_name_extracted') or metadata.get('client_full_name_extracted'))
+                                if not has_client_name:
+                                    logger.warning(f"⚠️ Document {document_id} is property file type but no client_full_name_extracted found - will mark as unlinked")
+                                
                                 try:
                                     self._find_or_create_property_file(document_id, metadata, document_type)
+                                    logger.info(f"✅ Completed property file processing for document {document_id}")
                                 except Exception as e:
-                                    logger.error(f"Error processing property file for document {document_id}: {e}")
-                                    if doc_type_normalized == 'ID':
+                                    logger.error(f"❌ Error processing property file for document {document_id}: {e}")
+                                    if 'ID' in doc_type_normalized:
                                         logger.error(f"❌ ID document {document_id} - Property file processing failed: {e}")
                                     import traceback
                                     logger.error(traceback.format_exc())
+                            else:
+                                logger.debug(f"Document {document_id} with type '{document_type}' is not a property file document type - skipping property file matching")
                         except Exception as e:
                             logger.warning(f"Property file processing error (non-critical): {e}")
                             import traceback
@@ -529,21 +562,115 @@ class TaskQueue:
         if is_id_document:
             logger.info(f"🔍 Processing ID document {document_id} for property file matching/creation")
         
-        client_full_name = metadata.get('client_full_name_extracted') or metadata.get('client_full_name')
-        property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
-        transaction_type = metadata.get('transaction_type') or 'BUY'
+        # Fix: Read fresh metadata from Firestore to ensure we have the latest extracted data
+        # This ensures we have the most up-to-date client_full_name_extracted and property_reference_extracted
+        try:
+            fresh_document = self.firestore_service.get_document(document_id)
+            if fresh_document:
+                fresh_metadata = fresh_document.get('metadata', {})
+                # Merge fresh metadata with parameter metadata, prioritizing fresh data
+                # This handles cases where metadata was updated in Firestore but parameter is stale
+                if fresh_metadata:
+                    # Update parameter metadata with fresh values, but preserve any existing values not in fresh
+                    for key, value in fresh_metadata.items():
+                        if value:  # Only update if fresh value is not empty/None
+                            metadata[key] = value
+                    logger.debug(f"Refreshed metadata from Firestore for document {document_id}. Keys: {list(metadata.keys())}")
+                else:
+                    logger.warning(f"No metadata found in Firestore document {document_id}, using parameter metadata")
+            else:
+                logger.warning(f"Document {document_id} not found in Firestore, using parameter metadata")
+        except Exception as e:
+            logger.warning(f"Failed to refresh metadata from Firestore for document {document_id}: {e}. Using parameter metadata.")
         
+        # Read client_full_name from metadata (try both fields)
+        client_full_name = metadata.get('client_full_name_extracted') or metadata.get('client_full_name')
+        
+        # Clean up client_full_name - handle empty strings and whitespace
+        if client_full_name:
+            client_full_name = str(client_full_name).strip()
+            if not client_full_name:  # Empty after strip
+                client_full_name = None
+        
+        # Helper function to clean and extract field from metadata
+        def clean_metadata_field(value):
+            """Clean metadata field: handle None, empty strings, and whitespace"""
+            if not value:
+                return None
+            cleaned = str(value).strip()
+            return cleaned if cleaned else None
+        
+        # For ID documents, property information is not available (ID documents only contain client name)
         if is_id_document:
-            logger.info(f"📋 ID document {document_id} - Extracted client_full_name: {client_full_name}, property_reference: {property_reference}")
+            property_reference = None
+            property_name = None
+            property_address = None
+            transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'  # Default to BUY, but matching won't require it
+            logger.info(
+                f"📋 [{doc_type_normalized}] Document {document_id} - Extracted data:\n"
+                f"   Client Full Name: {client_full_name or '(NOT FOUND)'}\n"
+                f"   Property Reference: (not available - ID documents don't contain property info)\n"
+                f"   Property Name: (not available - ID documents don't contain property info)\n"
+                f"   Property Address: (not available - ID documents don't contain property info)\n"
+                f"   Transaction Type: {transaction_type} (optional for ID matching)"
+            )
+            logger.info(f"ID document {document_id} - Property information not available (ID documents only contain client name)")
+        else:
+            # Read property fields with cleanup - handle both _extracted and non-_extracted variants
+            property_reference = clean_metadata_field(
+                metadata.get('property_reference_extracted') or 
+                metadata.get('property_reference')
+            )
+            property_name = clean_metadata_field(
+                metadata.get('property_name_extracted') or 
+                metadata.get('property_name')
+            )
+            property_address = clean_metadata_field(
+                metadata.get('property_address_extracted') or 
+                metadata.get('property_address') or
+                metadata.get('address')
+            )
+            transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'
+            
+            logger.info(
+                f"📋 [{doc_type_normalized}] Document {document_id} - Extracted data:\n"
+                f"   Client Full Name: {client_full_name or '(NOT FOUND)'}\n"
+                f"   Property Reference: {property_reference or '(not provided)'}\n"
+                f"   Property Name: {property_name or '(not provided)'}\n"
+                f"   Property Address: {property_address or '(not provided)'}\n"
+                f"   Transaction Type: {transaction_type}"
+            )
         
         if not client_full_name:
-            logger.warning(f"❌ Client full name not found in document {document_id} (type: {document_type})")
+            logger.warning(
+                f"❌ [{doc_type_normalized}] Document {document_id} - Client full name not found. "
+                f"Cannot proceed with property file matching/creation."
+            )
             if is_id_document:
-                logger.warning(f"⚠️ ID document {document_id} cannot create property file - client name extraction failed. Metadata keys: {list(metadata.keys())}")
-                logger.warning(f"⚠️ Available metadata values: client_full_name_extracted={metadata.get('client_full_name_extracted')}, client_full_name={metadata.get('client_full_name')}")
+                logger.warning(
+                    f"⚠️ ID document {document_id} cannot create property file - client name extraction failed.\n"
+                    f"   Metadata keys available: {list(metadata.keys())}\n"
+                    f"   client_full_name_extracted={metadata.get('client_full_name_extracted')}\n"
+                    f"   client_full_name={metadata.get('client_full_name')}"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ [{doc_type_normalized}] Document {document_id} - Missing client name.\n"
+                    f"   Metadata keys available: {list(metadata.keys())}\n"
+                    f"   client_full_name_extracted={metadata.get('client_full_name_extracted')}\n"
+                    f"   client_full_name={metadata.get('client_full_name')}"
+                )
             # Mark as unlinked but don't create property file without client name
             self.firestore_service.update_document(document_id, {'status': 'unlinked'})
             return
+        
+        # Log successful extraction for debugging
+        logger.info(
+            f"✅ [{doc_type_normalized}] Document {document_id} - Extracted fields validated:\n"
+            f"   Client Full Name: '{client_full_name}' ✓\n"
+            f"   Property Reference: {property_reference or '(not provided)'}\n"
+            f"   Transaction Type: {transaction_type}"
+        )
         
         if is_id_document:
             logger.info(f"✅ ID document {document_id} - Client name extracted successfully: {client_full_name}")
@@ -612,22 +739,68 @@ class TaskQueue:
         
         # Check if property file already exists for this client+property+transaction_type
         # If property_reference is missing, match only by client name and transaction type
-        if is_id_document:
-            logger.info(f"🔍 ID document {document_id} - Searching for matching property files (client: {client_full_name}, property: {property_reference}, transaction: {transaction_type})")
+        logger.info(
+            f"🔍 [{doc_type_normalized}] Document {document_id} - Searching for matching property files:\n"
+            f"   Client: {client_full_name}\n"
+            f"   Property Reference: {property_reference or '(not provided)'}\n"
+            f"   Property Name: {property_name or '(not provided)'}\n"
+            f"   Property Address: {property_address or '(not provided)'}\n"
+            f"   Transaction Type: {transaction_type}"
+        )
         
         existing_files = self.firestore_service.find_matching_property_file(
             client_full_name=client_full_name,
             property_reference=property_reference,  # Can be None - will match by name only
-            transaction_type=transaction_type
+            property_name=property_name,
+            property_address=property_address,
+            transaction_type=transaction_type,
+            is_id_document=is_id_document  # Pass flag to enable lenient transaction type matching for ID documents
         )
         
         if existing_files:
             # Property file exists - attach document to it
-            property_file_id = existing_files[0]['id']
             property_file = existing_files[0]
-            logger.info(f"Found existing property file {property_file_id} for client {client_full_name}")
-            if is_id_document:
-                logger.info(f"✅ ID document {document_id} - Matched with existing property file {property_file_id} (match confidence: {property_file.get('match_confidence', 'N/A')})")
+            property_file_id = property_file.get('id')
+            
+            if not property_file_id:
+                # Safely format error message to avoid ValueError with special characters
+                doc_type_str = str(doc_type_normalized)
+                doc_id_str = str(document_id)
+                logger.error(
+                    f"❌ [{doc_type_str}] Document {doc_id_str} - "
+                    f"Matched property file has no id field. Property file data: {property_file}"
+                )
+                # Try to get id from document reference if available
+                # If we can't get an id, we can't proceed with attachment
+                logger.warning(
+                    f"⚠️ [{doc_type_str}] Document {doc_id_str} - "
+                    f"Skipping property file attachment due to missing id. Document will remain unlinked."
+                )
+                return
+            
+            name_score = property_file.get('name_score', 0.0)
+            prop_score = property_file.get('property_score')
+            confidence = property_file.get('match_confidence', 0.0)
+            
+            # Safely format log message to avoid ValueError with special characters
+            # Convert all variables to strings to prevent format specifier issues
+            doc_type_str = str(doc_type_normalized)
+            doc_id_str = str(document_id)
+            prop_file_id_str = str(property_file_id)
+            confidence_str = f"{confidence:.3f}"
+            name_score_str = f"{name_score:.3f}"
+            prop_score_str = f"{prop_score:.3f}" if prop_score is not None else 'N/A'
+            client_name_str = str(property_file.get('client_full_name', 'N/A'))
+            prop_ref_str = str(property_file.get('property_reference', 'N/A'))
+            
+            logger.info(
+                f"✅ [{doc_type_str}] Document {doc_id_str} - Matched with existing property file {prop_file_id_str}:\n"
+                f"   Match Confidence: {confidence_str}\n"
+                f"   Name Score: {name_score_str}\n"
+                f"   Property Score: {prop_score_str}\n"
+                f"   Property File Client: {client_name_str}\n"
+                f"   Property File Reference: {prop_ref_str}"
+            )
             
             # Determine which document field to update based on document type
             doc_type_key = self._get_document_type_key(doc_type_normalized)
@@ -698,14 +871,32 @@ class TaskQueue:
                     if deal:
                         logger.info(f"Updated property file {property_file_id} with dealId {deal.get('id')}")
                 
-                logger.info(f"Attached {document_type} document {document_id} to existing property file {property_file_id}")
-                if is_id_document:
-                    logger.info(f"✅ ID document {document_id} - Successfully attached to property file {property_file_id}")
+                # Safely format log message to avoid ValueError with special characters
+                doc_type_str = str(doc_type_normalized)
+                doc_id_str = str(document_id)
+                prop_file_id_str = str(property_file_id)
+                doc_type_safe = str(document_type)
+                status_safe = str(update_data.get('status', 'N/A'))
+                logger.info(
+                    f"✅ [{doc_type_str}] Document {doc_id_str} - Successfully attached to property file {prop_file_id_str}\n"
+                    f"   Document type: {doc_type_safe}\n"
+                    f"   Property file status: {status_safe}"
+                )
         else:
             # No property file exists - create new one with this document
-            logger.info(f"No existing property file found - creating new one for client {client_full_name}")
-            if is_id_document:
-                logger.info(f"📝 ID document {document_id} - No matching property file found, creating new property file for client {client_full_name}")
+            # Safely format log message to avoid ValueError with special characters
+            doc_type_str = str(doc_type_normalized)
+            doc_id_str = str(document_id)
+            client_name_safe = str(client_full_name) if client_full_name else '(not provided)'
+            prop_ref_safe = str(property_reference) if property_reference else '(not provided)'
+            trans_type_safe = str(transaction_type) if transaction_type else '(not provided)'
+            logger.info(
+                f"📝 [{doc_type_str}] Document {doc_id_str} - No matching property file found\n"
+                f"   Client: {client_name_safe}\n"
+                f"   Property Reference: {prop_ref_safe}\n"
+                f"   Transaction Type: {trans_type_safe}\n"
+                f"   Creating new property file..."
+            )
             self._create_property_file_from_document(document_id, metadata, document_type, client_id, property_id)
     
     def _get_document_type_key(self, doc_type_normalized: str) -> Optional[str]:
@@ -820,4 +1011,3 @@ class TaskQueue:
             original_filename,
             job_id
         )
-

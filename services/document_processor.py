@@ -751,6 +751,7 @@ Extraction Rules:
 - If a field is not found, omit it from JSON (don't use null or empty strings)
 - Extract all relevant information comprehensively
 - **MOST IMPORTANT**: For client_full_name, extract the COMPLETE full name of the person from the ID card. This is critical for matching documents. Look carefully for the name field - it may be labeled as "Name", "Full Name", "Holder Name", or may be in a "Given Name" + "Surname" format. Combine separate name fields into one complete full name.
+- **CRITICAL**: ID documents (passports, driver's licenses, national IDs) do NOT contain property information. Do NOT extract property_reference, property_name, or property_address from ID documents. Only extract client_full_name for matching purposes. Property information is only found in SPA, Invoice, and Proof of Payment documents, NOT in ID documents.
 
 Return in JSON format with all extracted fields:
 {{
@@ -1654,12 +1655,19 @@ Return in JSON format:
                         else:
                             result['client_full_name_extracted'] = str(client_full_name).strip() if client_full_name else ''
                         
-                        # Extract property_reference (for property files)
-                        property_reference = json_data.get('property_reference') or json_data.get('property_id') or json_data.get('unit_number') or ''
-                        if isinstance(property_reference, str):
-                            result['property_reference_extracted'] = property_reference.strip()
+                        # Extract property_reference (for property files) - SKIP for ID documents
+                        # ID documents don't contain property information, only client name
+                        doc_type_normalized = document_type.upper().strip() if document_type else ''
+                        if doc_type_normalized != 'ID':
+                            property_reference = json_data.get('property_reference') or json_data.get('property_id') or json_data.get('unit_number') or ''
+                            if isinstance(property_reference, str):
+                                result['property_reference_extracted'] = property_reference.strip()
+                            else:
+                                result['property_reference_extracted'] = str(property_reference).strip() if property_reference else ''
                         else:
-                            result['property_reference_extracted'] = str(property_reference).strip() if property_reference else ''
+                            # ID documents don't contain property information
+                            result['property_reference_extracted'] = None
+                            logger.info("ID document - skipping property_reference extraction (ID documents don't contain property info)")
                         
                         # Extract transaction_type (for SPA documents)
                         transaction_type = json_data.get('transaction_type', '').upper()
@@ -1732,7 +1740,7 @@ Return in JSON format:
                             result['complete_filename'] = result['document_no']
                             result['classification'] = 'UNKNOWN'
                             result['success'] = False
-                            result['error'] = "Could not extract Document No from voucher"
+                            result['error'] = "Could not extract Document No from document"
                             result['organized_path'] = None
                             logger.warning(f"Voucher document missing document_no - marking as failed: {document_type}")
                         else:

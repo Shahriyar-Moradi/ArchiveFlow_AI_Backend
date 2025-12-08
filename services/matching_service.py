@@ -12,7 +12,7 @@ class MatchingService:
     
     @staticmethod
     def normalize_name(name: str) -> str:
-        """Normalize a name for comparison with improved handling"""
+        """Normalize a name for comparison with improved handling of variations"""
         if not name:
             return ""
         
@@ -32,13 +32,31 @@ class MatchingService:
         # Handle hyphen variations (Al-Maktoum vs Al Maktoum)
         normalized = re.sub(r'\s*-\s*', ' ', normalized)
         
+        # Handle common Arabic/English name abbreviations
+        # Map common abbreviations to full forms for better matching
+        abbreviation_map = {
+            r'\bmohd\b': 'mohammed',
+            r'\bmoh\b': 'mohammed',
+            r'\bmd\b': 'mohammed',
+            r'\bali\b': 'ali',  # Keep as is, but normalize variations
+            r'\bala\b': 'ala',
+            r'\balaa\b': 'ala',
+        }
+        for pattern, replacement in abbreviation_map.items():
+            normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+        
         # Handle middle name/initial variations
         # "Ahmed Al Maktoum" vs "Ahmed A. Maktoum" vs "A. Al Maktoum"
-        # Normalize single letter initials to full form if possible
-        normalized = re.sub(r'\b([a-z])\s+', r'\1 ', normalized)  # Keep single letters but normalize spacing
+        # Normalize single letter initials - remove periods and normalize spacing
+        normalized = re.sub(r'\b([a-z])\.\s*', r'\1 ', normalized)  # Remove period after single letter
+        normalized = re.sub(r'\b([a-z])\s+', r'\1 ', normalized)  # Normalize spacing after single letter
         
-        # Remove special characters except spaces and hyphens (already normalized)
+        # Remove special characters except spaces (hyphens already normalized to spaces)
         normalized = re.sub(r'[^\w\s]', '', normalized)
+        
+        # Final whitespace cleanup
+        normalized = re.sub(r'\s+', ' ', normalized)
+        normalized = normalized.strip()
         
         return normalized
     
@@ -65,7 +83,7 @@ class MatchingService:
     
     @staticmethod
     def similarity_score(s1: str, s2: str) -> float:
-        """Calculate similarity score between two strings (0.0 to 1.0)"""
+        """Calculate similarity score between two strings (0.0 to 1.0) with enhanced matching"""
         if not s1 or not s2:
             return 0.0
         
@@ -75,17 +93,66 @@ class MatchingService:
         if normalized1 == normalized2:
             return 1.0
         
-        # Check substring match
+        # Check substring match (one name contains the other)
         if normalized1 in normalized2 or normalized2 in normalized1:
-            return 0.85
+            # If one is a substring of the other, check if it's a meaningful match
+            # (e.g., "Ahmed Al Maktoum" contains "Ahmed Maktoum")
+            shorter = normalized1 if len(normalized1) < len(normalized2) else normalized2
+            longer = normalized2 if len(normalized1) < len(normalized2) else normalized1
+            
+            # Split into words to check if key parts match
+            shorter_words = set(shorter.split())
+            longer_words = set(longer.split())
+            
+            # If shorter name's words are mostly in longer name, it's a good match
+            if len(shorter_words) > 0:
+                overlap_ratio = len(shorter_words & longer_words) / len(shorter_words)
+                if overlap_ratio >= 0.8:  # 80% of words match
+                    return 0.90
+                elif overlap_ratio >= 0.6:  # 60% of words match
+                    return 0.80
+                else:
+                    return 0.75  # Basic substring match
         
-        # Calculate Levenshtein distance
+        # Check for partial name matches (first name + last name when middle differs)
+        words1 = normalized1.split()
+        words2 = normalized2.split()
+        
+        if len(words1) >= 2 and len(words2) >= 2:
+            # Check if first and last names match (ignoring middle names)
+            first_last_match = (
+                words1[0] == words2[0] and  # First name matches
+                words1[-1] == words2[-1]   # Last name matches
+            )
+            
+            if first_last_match:
+                # Calculate similarity based on how many words match
+                set1 = set(words1)
+                set2 = set(words2)
+                common_words = len(set1 & set2)
+                total_unique_words = len(set1 | set2)
+                
+                if total_unique_words > 0:
+                    word_similarity = common_words / total_unique_words
+                    # Boost score for first+last match, but reduce slightly for middle name differences
+                    base_score = 0.75 + (word_similarity * 0.20)
+                    return min(base_score, 0.95)  # Cap at 0.95 for partial matches
+        
+        # Calculate Levenshtein distance for overall similarity
         max_len = max(len(normalized1), len(normalized2))
         if max_len == 0:
             return 1.0
         
         distance = MatchingService.levenshtein_distance(normalized1, normalized2)
         similarity = 1.0 - (distance / max_len)
+        
+        # Boost similarity if word sets have significant overlap
+        words1_set = set(normalized1.split())
+        words2_set = set(normalized2.split())
+        if len(words1_set) > 0 and len(words2_set) > 0:
+            word_overlap = len(words1_set & words2_set) / len(words1_set | words2_set)
+            # Combine Levenshtein similarity with word overlap
+            similarity = max(similarity, word_overlap * 0.9)
         
         return similarity
     
