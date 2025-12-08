@@ -889,11 +889,13 @@ class TaskQueue:
             doc_id_str = str(document_id)
             client_name_safe = str(client_full_name) if client_full_name else '(not provided)'
             prop_ref_safe = str(property_reference) if property_reference else '(not provided)'
+            prop_name_safe = str(property_name) if property_name else '(not provided)'
             trans_type_safe = str(transaction_type) if transaction_type else '(not provided)'
             logger.info(
                 f"📝 [{doc_type_str}] Document {doc_id_str} - No matching property file found\n"
                 f"   Client: {client_name_safe}\n"
                 f"   Property Reference: {prop_ref_safe}\n"
+                f"   Property Name: {prop_name_safe}\n"
                 f"   Transaction Type: {trans_type_safe}\n"
                 f"   Creating new property file..."
             )
@@ -920,6 +922,7 @@ class TaskQueue:
         
         client_full_name = metadata.get('client_full_name_extracted') or metadata.get('client_full_name')
         property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
+        property_name = metadata.get('property_name_extracted') or metadata.get('property_name')
         transaction_type = metadata.get('transaction_type') or 'BUY'
         
         # Normalize document_type
@@ -962,6 +965,7 @@ class TaskQueue:
             'client_full_name': client_full_name,
             'property_id': property_id,
             'property_reference': property_reference,
+            'property_name': property_name,
             'transaction_type': transaction_type,
             'status': 'INCOMPLETE',
             'created_from_document_type': doc_type_normalized  # Track which document type created this

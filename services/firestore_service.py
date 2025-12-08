@@ -1845,7 +1845,8 @@ class FirestoreService:
         property_reference: Optional[str] = None,
         transaction_type: Optional[str] = None,
         client_id: Optional[str] = None,
-        property_id: Optional[str] = None
+        property_id: Optional[str] = None,
+        property_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Find existing property file or create new one.
@@ -1872,6 +1873,7 @@ class FirestoreService:
             'client_full_name': client_full_name,
             'property_id': property_id,
             'property_reference': property_reference,
+            'property_name': property_name,
             'transaction_type': transaction_type or 'BUY',
             'status': 'INCOMPLETE'
         }

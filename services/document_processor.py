@@ -781,22 +781,23 @@ Extract the following fields (include all that are present, omit those that are 
 4. **Amount/Total**: Total amount, subtotal, tax, fees, discounts - include currency (USD, EUR, AED, etc.)
 5. **Client Full Name** (CRITICAL for property files): The full name of the client/buyer/tenant. This is the person who is buying or renting the property. Look for fields like "Buyer Name", "Client Name", "Tenant Name", "Purchaser Name", "Party Name", etc. Extract the COMPLETE full name (first name + last name) as "client_full_name" in the JSON.
 6. **Property Reference** (CRITICAL for property files): The property unit number, listing code, or internal property identifier. Look for fields like "Unit Number", "Property Reference", "Listing Code", "Property ID", "Unit ID", "Apartment Number", "Villa Number", etc. Extract this as "property_reference" in the JSON.
-7. **Transaction Type** (for SPA documents): Determine if this is a "BUY", "RENT", or "SELL" transaction. Look for keywords like "purchase", "sale", "rent", "lease", "tenancy", etc. Extract as "transaction_type" in the JSON (should be "BUY", "RENT", or "SELL").
-8. **Parties involved**: 
+7. **Property Name/Title** (CRITICAL for property files): The full name or title of the property. Look for fields like "Property Name", "Property Title", "Listing Name", "Unit Name", "Villa Name", "Apartment Name", "Project Name", "Development Name", "Property Description", etc. This should be the descriptive name of the property (e.g., "Palm Jumeirah Villa 101", "Downtown Apartment 5A", "Marina Tower Unit 1203"), not just the reference number. Extract this as "property_name" in the JSON.
+8. **Transaction Type** (for SPA documents): Determine if this is a "BUY", "RENT", or "SELL" transaction. Look for keywords like "purchase", "sale", "rent", "lease", "tenancy", etc. Extract as "transaction_type" in the JSON (should be "BUY", "RENT", or "SELL").
+9. **Parties involved**: 
    - Buyer, seller, client, customer, vendor, supplier
    - Names, addresses, contact information
    - For contracts: parties to the agreement
    - For real estate: buyer, seller, landlord, tenant, agent
-9. **Items/services listed**: 
+10. **Items/services listed**: 
    - Line items, products, services
    - Quantities, descriptions, unit prices
    - For contracts: services or deliverables
    - For real estate: property details, address, square footage
-10. **Terms and conditions**: 
+11. **Terms and conditions**: 
    - Payment terms, delivery terms
    - Contract terms, conditions, clauses
    - Legal terms, warranties, guarantees
-11. **Signature/authorization info**:
+12. **Signature/authorization info**:
    - Signatures present (yes/no)
    - Signatory names and titles
    - Authorization stamps or seals
@@ -811,6 +812,7 @@ Extraction Rules:
 - Extract all relevant information comprehensively
 - For client_full_name: Extract the complete full name of the buyer/client/tenant (the person who will own or rent the property)
 - For property_reference: Extract unit number, listing code, or any property identifier mentioned in the document
+- For property_name: Extract the full descriptive name or title of the property (e.g., "Palm Jumeirah Villa 101", "Downtown Apartment 5A"). This is different from property_reference which is just the identifier/code.
 - For transaction_type: Only extract for SPA documents, should be "BUY", "RENT", or "SELL"
 
 Return in JSON format with all extracted fields:
@@ -826,6 +828,7 @@ Return in JSON format with all extracted fields:
     "tax": "200.00",
     "client_full_name": "Ahmed Al Maktoum",
     "property_reference": "Unit 101",
+    "property_name": "Palm Jumeirah Villa 101",
     "transaction_type": "BUY",
     "buyer": {{
         "name": "Company Name",
@@ -1664,10 +1667,18 @@ Return in JSON format:
                                 result['property_reference_extracted'] = property_reference.strip()
                             else:
                                 result['property_reference_extracted'] = str(property_reference).strip() if property_reference else ''
+                            
+                            # Extract property_name (for property files) - SKIP for ID documents
+                            property_name = json_data.get('property_name') or json_data.get('property_title') or json_data.get('listing_name') or json_data.get('unit_name') or ''
+                            if isinstance(property_name, str):
+                                result['property_name_extracted'] = property_name.strip()
+                            else:
+                                result['property_name_extracted'] = str(property_name).strip() if property_name else ''
                         else:
                             # ID documents don't contain property information
                             result['property_reference_extracted'] = None
-                            logger.info("ID document - skipping property_reference extraction (ID documents don't contain property info)")
+                            result['property_name_extracted'] = None
+                            logger.info("ID document - skipping property_reference and property_name extraction (ID documents don't contain property info)")
                         
                         # Extract transaction_type (for SPA documents)
                         transaction_type = json_data.get('transaction_type', '').upper()
@@ -1696,7 +1707,7 @@ Return in JSON format:
                         result['complete_filename'] = result['document_no'] or original_filename or 'document'
                         
                         # Store all extracted data
-                        logger.info(f"Extracted general document data: Type={document_type}, Doc No={result.get('document_no', 'N/A')}, Date={result.get('document_date', 'N/A')}, Client={result.get('client_full_name_extracted', 'N/A')}, Property={result.get('property_reference_extracted', 'N/A')}")
+                        logger.info(f"Extracted general document data: Type={document_type}, Doc No={result.get('document_no', 'N/A')}, Date={result.get('document_date', 'N/A')}, Client={result.get('client_full_name_extracted', 'N/A')}, Property Ref={result.get('property_reference_extracted', 'N/A')}, Property Name={result.get('property_name_extracted', 'N/A')}")
                     
                 else:
                     raise ValueError("No JSON found in response")
