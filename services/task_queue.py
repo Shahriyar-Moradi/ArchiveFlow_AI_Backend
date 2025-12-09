@@ -632,6 +632,29 @@ class TaskQueue:
             )
             transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'
             
+            # If property_name is empty, try to construct it from available fields
+            if not property_name or property_name.strip() == '':
+                if property_reference and property_address:
+                    property_name = f"{property_reference} - {property_address}"
+                    logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Constructed property_name from property_reference + address: {property_name}")
+                elif property_reference:
+                    property_name = property_reference
+                    logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Using property_reference as property_name: {property_name}")
+                elif property_address:
+                    property_name = property_address
+                    logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Using property_address as property_name: {property_name}")
+                else:
+                    # Try to get property_name from linked property document if property_id exists
+                    if property_id:
+                        try:
+                            property_doc = self.firestore_service.get_property(property_id)
+                            if property_doc:
+                                property_name = property_doc.get('title') or property_doc.get('name') or property_doc.get('reference') or None
+                                if property_name:
+                                    logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Retrieved property_name from property document: {property_name}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ [{doc_type_normalized}] Document {document_id} - Failed to get property_name from property document: {e}")
+            
             logger.info(
                 f"📋 [{doc_type_normalized}] Document {document_id} - Extracted data:\n"
                 f"   Client Full Name: {client_full_name or '(NOT FOUND)'}\n"
@@ -858,18 +881,28 @@ class TaskQueue:
                     document_update['dealId'] = deal.get('id')
                 self.firestore_service.update_document(document_id, document_update)
                 
-                # Update property file with agent_id and dealId if not set
+                # Update property file with agent_id, dealId, and property_name if not set
                 property_file_update = {}
                 if agent_id and not property_file.get('agent_id'):
                     property_file_update['agent_id'] = agent_id
                 if deal and not property_file.get('dealId'):
                     property_file_update['dealId'] = deal.get('id')
+                
+                # Update property_name if it's missing in the existing property file
+                existing_property_name = property_file.get('property_name')
+                if not existing_property_name or existing_property_name.strip() == '':
+                    if property_name and property_name.strip():
+                        property_file_update['property_name'] = property_name
+                        logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Updating property file {property_file_id} with property_name: {property_name}")
+                
                 if property_file_update:
                     self.firestore_service.update_property_file(property_file_id, property_file_update)
                     if agent_id:
                         logger.info(f"Updated property file {property_file_id} with agent_id {agent_id}")
                     if deal:
                         logger.info(f"Updated property file {property_file_id} with dealId {deal.get('id')}")
+                    if 'property_name' in property_file_update:
+                        logger.info(f"Updated property file {property_file_id} with property_name: {property_file_update['property_name']}")
                 
                 # Safely format log message to avoid ValueError with special characters
                 doc_type_str = str(doc_type_normalized)
@@ -923,11 +956,43 @@ class TaskQueue:
         client_full_name = metadata.get('client_full_name_extracted') or metadata.get('client_full_name')
         property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
         property_name = metadata.get('property_name_extracted') or metadata.get('property_name')
+        property_address = metadata.get('property_address_extracted') or metadata.get('property_address') or metadata.get('address')
         transaction_type = metadata.get('transaction_type') or 'BUY'
         
         # Normalize document_type
         doc_type_normalized = document_type.upper().strip() if document_type else ''
         is_id_document = doc_type_normalized == 'ID'
+        
+        # Ensure property_name is always set - construct from available data if missing
+        if not property_name or property_name.strip() == '':
+            if property_reference and property_address:
+                property_name = f"{property_reference} - {property_address}"
+                logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Constructed property_name for property file: {property_name}")
+            elif property_reference:
+                property_name = property_reference
+                logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Using property_reference as property_name: {property_name}")
+            elif property_address:
+                property_name = property_address
+                logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Using property_address as property_name: {property_name}")
+            elif property_id:
+                # Try to get property_name from linked property document
+                try:
+                    property_doc = self.firestore_service.get_property(property_id)
+                    if property_doc:
+                        property_name = property_doc.get('title') or property_doc.get('name') or property_doc.get('reference') or None
+                        if property_name:
+                            logger.info(f"🔧 [{doc_type_normalized}] Document {document_id} - Retrieved property_name from property document: {property_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ [{doc_type_normalized}] Document {document_id} - Failed to get property_name from property document: {e}")
+            
+            # Last resort: construct from client name and transaction type
+            if not property_name or property_name.strip() == '':
+                if client_full_name:
+                    property_name = f"{client_full_name} - {transaction_type} Property"
+                    logger.warning(f"⚠️ [{doc_type_normalized}] Document {document_id} - Using fallback property_name: {property_name}")
+                else:
+                    property_name = f"{transaction_type} Property"
+                    logger.warning(f"⚠️ [{doc_type_normalized}] Document {document_id} - Using minimal fallback property_name: {property_name}")
         
         # Get the document type key
         doc_type_key = self._get_document_type_key(doc_type_normalized)

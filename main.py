@@ -4255,6 +4255,7 @@ async def get_folder_documents(folder_name: str):
 
 # Document status endpoints - MUST be defined BEFORE the generic /api/document/{folder_name}/{document_name} route
 # to avoid route matching conflicts
+# Using explicit paths with literal segments to ensure proper route matching
 
 @app.get("/api/document/{document_id:path}/status")
 async def get_document_status(document_id: str):
@@ -4278,7 +4279,7 @@ async def get_document_status(document_id: str):
             "data": None
         })
 
-@app.get("/api/document/{document_id:path}/processing-status")
+@app.get("/api/document/{document_id:path}/processing-status", name="get_document_processing_status")
 async def get_document_processing_status(document_id: str):
     """Get detailed processing status for a specific document from Firestore"""
     if not firestore_service:
@@ -4335,12 +4336,15 @@ async def get_document_processing_status(document_id: str):
                             logger.warning(f"Flow search failed: {search_error}")
             
             logger.warning(f"Document not found: {document_id}")
-            return JSONResponse(content={
-                "success": False,
-                "document_id": document_id,
-                "message": "Document not found in Firestore",
-                "status": "not_found"
-            })
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "document_id": document_id,
+                    "message": "Document not found in Firestore",
+                    "status": "not_found"
+                },
+                status_code=404
+            )
     except Exception as e:
         logger.error(f"Failed to get document status: {e}")
         import traceback
@@ -4354,6 +4358,10 @@ async def get_document_processing_status(document_id: str):
 @app.get("/api/document/{folder_name}/{document_name}")
 async def get_document(folder_name: str, document_name: str):
     """Get a specific document file"""
+    # This route should only match two-segment paths (folder/file)
+    # Status endpoints use /api/document/{document_id:path}/status pattern
+    # which has a path parameter that can include multiple segments
+    
     file_path = ORGANIZED_DIR / folder_name / document_name
     
     if not file_path.exists():

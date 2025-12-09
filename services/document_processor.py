@@ -781,7 +781,13 @@ Extract the following fields (include all that are present, omit those that are 
 4. **Amount/Total**: Total amount, subtotal, tax, fees, discounts - include currency (USD, EUR, AED, etc.)
 5. **Client Full Name** (CRITICAL for property files): The full name of the client/buyer/tenant. This is the person who is buying or renting the property. Look for fields like "Buyer Name", "Client Name", "Tenant Name", "Purchaser Name", "Party Name", etc. Extract the COMPLETE full name (first name + last name) as "client_full_name" in the JSON.
 6. **Property Reference** (CRITICAL for property files): The property unit number, listing code, or internal property identifier. Look for fields like "Unit Number", "Property Reference", "Listing Code", "Property ID", "Unit ID", "Apartment Number", "Villa Number", etc. Extract this as "property_reference" in the JSON.
-7. **Property Name/Title** (CRITICAL for property files): The full name or title of the property. Look for fields like "Property Name", "Property Title", "Listing Name", "Unit Name", "Villa Name", "Apartment Name", "Project Name", "Development Name", "Property Description", etc. This should be the descriptive name of the property (e.g., "Palm Jumeirah Villa 101", "Downtown Apartment 5A", "Marina Tower Unit 1203"), not just the reference number. Extract this as "property_name" in the JSON.
+7. **Property Name/Title** (CRITICAL for property files): The full name or title of the property. This is EXTREMELY IMPORTANT - you MUST extract a property name if any property information is present in the document. Look for fields like "Property Name", "Property Title", "Listing Name", "Unit Name", "Villa Name", "Apartment Name", "Project Name", "Development Name", "Property Description", "Building Name", "Property Location", "Address", "Property Address", etc. This should be the descriptive name of the property (e.g., "Palm Jumeirah Villa 101", "Downtown Apartment 5A", "Marina Tower Unit 1203", "Dubai Marina Apartment 1205", "Burj Khalifa Tower 45A"). If a single "property_name" field is not found, try to construct it from available information:
+   - Combine property_reference + address (e.g., "Unit 101 - Dubai Marina")
+   - Combine property_reference + building_name (e.g., "Unit 5A - Marina Tower")
+   - Use development_name + property_reference (e.g., "Palm Jumeirah - Villa 101")
+   - Use address if it contains property information
+   - Use property_description if it contains a name
+   The property_name should be descriptive and meaningful, not just a reference number. Extract this as "property_name" in the JSON. If you cannot find or construct a property name, you may also extract related fields like "property_description", "development_name", "project_name", "building_name", "apartment_name", "villa_name", "property_location", or "address" separately - these will be used to construct a property name if needed.
 8. **Transaction Type** (for SPA documents): Determine if this is a "BUY", "RENT", or "SELL" transaction. Look for keywords like "purchase", "sale", "rent", "lease", "tenancy", etc. Extract as "transaction_type" in the JSON (should be "BUY", "RENT", or "SELL").
 9. **Parties involved**: 
    - Buyer, seller, client, customer, vendor, supplier
@@ -812,7 +818,7 @@ Extraction Rules:
 - Extract all relevant information comprehensively
 - For client_full_name: Extract the complete full name of the buyer/client/tenant (the person who will own or rent the property)
 - For property_reference: Extract unit number, listing code, or any property identifier mentioned in the document
-- For property_name: Extract the full descriptive name or title of the property (e.g., "Palm Jumeirah Villa 101", "Downtown Apartment 5A"). This is different from property_reference which is just the identifier/code.
+- For property_name: Extract the full descriptive name or title of the property (e.g., "Palm Jumeirah Villa 101", "Downtown Apartment 5A", "Marina Tower Unit 1203", "Dubai Marina Apartment 1205"). This is different from property_reference which is just the identifier/code. If a direct property_name field is not found, construct it from available fields like property_reference + address, property_reference + building_name, development_name + property_reference, etc. Look in property description sections, headers, property details sections, and address fields. The property_name is CRITICAL - always try to extract or construct a meaningful property name if any property information exists in the document.
 - For transaction_type: Only extract for SPA documents, should be "BUY", "RENT", or "SELL"
 
 Return in JSON format with all extracted fields:
@@ -1669,11 +1675,68 @@ Return in JSON format:
                                 result['property_reference_extracted'] = str(property_reference).strip() if property_reference else ''
                             
                             # Extract property_name (for property files) - SKIP for ID documents
-                            property_name = json_data.get('property_name') or json_data.get('property_title') or json_data.get('listing_name') or json_data.get('unit_name') or ''
+                            # Try multiple field names for property_name
+                            property_name = (
+                                json_data.get('property_name') or 
+                                json_data.get('property_title') or 
+                                json_data.get('listing_name') or 
+                                json_data.get('unit_name') or
+                                json_data.get('property_description') or
+                                json_data.get('development_name') or
+                                json_data.get('project_name') or
+                                json_data.get('building_name') or
+                                json_data.get('apartment_name') or
+                                json_data.get('villa_name') or
+                                json_data.get('property_location') or
+                                ''
+                            )
+                            
+                            # Clean and validate property_name
                             if isinstance(property_name, str):
-                                result['property_name_extracted'] = property_name.strip()
+                                property_name = property_name.strip()
                             else:
-                                result['property_name_extracted'] = str(property_name).strip() if property_name else ''
+                                property_name = str(property_name).strip() if property_name else ''
+                            
+                            # If property_name is still empty, try to construct it from available fields
+                            if not property_name or property_name == '':
+                                property_reference_val = result.get('property_reference_extracted', '')
+                                
+                                # Get additional fields that might help construct property name
+                                address = json_data.get('address') or json_data.get('property_address') or ''
+                                development_name = json_data.get('development_name') or ''
+                                project_name = json_data.get('project_name') or ''
+                                building_name = json_data.get('building_name') or ''
+                                property_location = json_data.get('property_location') or ''
+                                
+                                # Construct property_name from available fields
+                                if property_reference_val:
+                                    if address:
+                                        property_name = f"{property_reference_val} - {address}"
+                                    elif building_name:
+                                        property_name = f"{property_reference_val} - {building_name}"
+                                    elif development_name:
+                                        property_name = f"{development_name} - {property_reference_val}"
+                                    elif project_name:
+                                        property_name = f"{project_name} - {property_reference_val}"
+                                    elif property_location:
+                                        property_name = f"{property_reference_val} - {property_location}"
+                                    else:
+                                        property_name = property_reference_val
+                                elif address:
+                                    property_name = address
+                                elif building_name:
+                                    property_name = building_name
+                                elif development_name:
+                                    property_name = development_name
+                                elif project_name:
+                                    property_name = project_name
+                                elif property_location:
+                                    property_name = property_location
+                                
+                                if property_name:
+                                    logger.info(f"Constructed property_name from available fields: {property_name}")
+                            
+                            result['property_name_extracted'] = property_name if property_name else ''
                         else:
                             # ID documents don't contain property information
                             result['property_reference_extracted'] = None
