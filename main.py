@@ -8358,16 +8358,45 @@ async def match_unlinked_documents(request_data: Dict[str, Any] = Body(...)):
             if not client_full_name:
                 continue
             
-            # Try to find or create property file
-            property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
-            transaction_type = metadata.get('transaction_type') or 'BUY'
+            # Helper function to clean and extract field from metadata
+            def clean_metadata_field(value):
+                """Clean metadata field: handle None, empty strings, and whitespace"""
+                if not value:
+                    return None
+                cleaned = str(value).strip()
+                return cleaned if cleaned else None
             
-            # For ID documents, use lenient transaction type matching
+            # For ID documents, property information is not available
             is_id_document = (doc_type_normalized == 'ID')
+            
+            if is_id_document:
+                # ID documents don't have property information
+                property_reference = None
+                property_name = None
+                property_address = None
+                transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'
+            else:
+                # Extract all property fields for non-ID documents (invoices, proof of payment, SPA)
+                property_reference = clean_metadata_field(
+                    metadata.get('property_reference_extracted') or 
+                    metadata.get('property_reference')
+                )
+                property_name = clean_metadata_field(
+                    metadata.get('property_name_extracted') or 
+                    metadata.get('property_name')
+                )
+                property_address = clean_metadata_field(
+                    metadata.get('property_address_extracted') or 
+                    metadata.get('property_address') or
+                    metadata.get('address')
+                )
+                transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'
             
             matching_files = firestore_service.find_matching_property_file(
                 client_full_name=client_full_name,
                 property_reference=property_reference,
+                property_name=property_name,
+                property_address=property_address,
                 transaction_type=transaction_type,
                 is_id_document=is_id_document
             )
@@ -8578,8 +8607,6 @@ async def auto_attach_document(request_data: Dict[str, Any] = Body(...)):
             })
         
         client_full_name = metadata.get('client_full_name_extracted') or metadata.get('client_full_name')
-        property_reference = metadata.get('property_reference_extracted') or metadata.get('property_reference')
-        transaction_type = metadata.get('transaction_type') or 'BUY'
         
         if not client_full_name:
             # Mark as unlinked
@@ -8589,13 +8616,46 @@ async def auto_attach_document(request_data: Dict[str, Any] = Body(...)):
                 "message": "Client name not found in document"
             })
         
-        # For ID documents, use lenient transaction type matching
+        # Helper function to clean and extract field from metadata
+        def clean_metadata_field(value):
+            """Clean metadata field: handle None, empty strings, and whitespace"""
+            if not value:
+                return None
+            cleaned = str(value).strip()
+            return cleaned if cleaned else None
+        
+        # For ID documents, property information is not available
         is_id_document = (doc_type_normalized == 'ID')
+        
+        if is_id_document:
+            # ID documents don't have property information
+            property_reference = None
+            property_name = None
+            property_address = None
+            transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'
+        else:
+            # Extract all property fields for non-ID documents (invoices, proof of payment)
+            property_reference = clean_metadata_field(
+                metadata.get('property_reference_extracted') or 
+                metadata.get('property_reference')
+            )
+            property_name = clean_metadata_field(
+                metadata.get('property_name_extracted') or 
+                metadata.get('property_name')
+            )
+            property_address = clean_metadata_field(
+                metadata.get('property_address_extracted') or 
+                metadata.get('property_address') or
+                metadata.get('address')
+            )
+            transaction_type = clean_metadata_field(metadata.get('transaction_type')) or 'BUY'
         
         # Find matching property files
         matching_files = firestore_service.find_matching_property_file(
             client_full_name=client_full_name,
             property_reference=property_reference,
+            property_name=property_name,
+            property_address=property_address,
             transaction_type=transaction_type,
             is_id_document=is_id_document
         )

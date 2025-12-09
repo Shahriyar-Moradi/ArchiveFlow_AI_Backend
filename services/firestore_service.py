@@ -1560,19 +1560,31 @@ class FirestoreService:
         is_id_document: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        Find matching property files using two-stage matching:
-        1. Primary Stage: Match by client full name (REQUIRED)
-        2. Secondary Stage: Use property information as tiebreaker when multiple matches exist
+        Find matching property files based on client name.
+        
+        IMPORTANT: Client name is the ONLY required factor for matching.
+        All other factors (property information, transaction type) are completely
+        optional and only used as tiebreakers when available.
+        
+        Matching Rules:
+        1. Client name matching is REQUIRED - only property files with matching
+           client names (above similarity threshold) are considered valid matches.
+        2. Property information (reference, name, address) is OPTIONAL - if provided,
+           it's used as a tiebreaker when multiple property files match the client name.
+           A match is NEVER rejected due to missing property information.
+        3. Transaction type is OPTIONAL for ALL document types - if provided, matching
+           transaction types are preferred but non-matching ones are still considered.
+           A match is NEVER rejected due to transaction type mismatch.
         
         For ID documents (is_id_document=True):
-        - Transaction type matching is optional (not required)
-        - All property files are considered regardless of transaction type
-        - Property files with matching transaction type are preferred but not required
+        - Property information is not available (ID documents don't contain property info)
+        - Matching is based solely on client name
+        - Transaction type matching is optional (preferred but not required)
         
         Returns all property files that match the client name, sorted by:
-        - Name score (highest first)
-        - Transaction type match (for ID documents, prefer but don't require)
-        - Property score (if available, as tiebreaker)
+        - Name score (highest first) - PRIMARY SORT FACTOR
+        - Transaction type match (preferred but optional) - SECONDARY TIEBREAKER
+        - Property score (if available, as tiebreaker) - TERTIARY TIEBREAKER
         """
         try:
             from services.matching_service import MatchingService
@@ -1661,6 +1673,9 @@ class FirestoreService:
                 if file_prop_address and file_prop_address.strip():
                     file_props.append(MatchingService.normalize_name(file_prop_address.strip()))
                 
+                # Property score is OPTIONAL - None if no property info available
+                # A match is NEVER rejected due to missing property information
+                # Property score is only used as a tiebreaker when multiple matches exist
                 prop_score = None
                 if has_property_hints and file_props:
                     # Best pairwise score across hints and file props
@@ -1669,7 +1684,9 @@ class FirestoreService:
                         default=None
                     )
                 
-                # Check transaction type match if specified
+                # Transaction type match is OPTIONAL - only used for preference, not requirement
+                # A match is NEVER rejected due to transaction type mismatch
+                # Non-matching transaction types are still considered valid matches
                 transaction_match = True
                 if transaction_type and file_transaction_type:
                     transaction_match = transaction_type.upper() == file_transaction_type.upper()
@@ -1690,6 +1707,9 @@ class FirestoreService:
                 })
             
             # Stage 1: Filter by client name (REQUIRED) - primary threshold
+            # IMPORTANT: Only name_score determines if a candidate is a valid match.
+            # Property information and transaction type are NOT used to filter candidates.
+            # They are only used later for sorting/ranking when multiple matches exist.
             # For ID documents, don't require transaction_match (transaction type is optional)
             # For other documents, transaction_match is preferred but not strictly required at this stage
             name_matches = [
@@ -1698,15 +1718,20 @@ class FirestoreService:
             ]
             
             # For non-ID documents, prefer transaction_match but don't exclude all non-matches
+            # IMPORTANT: Transaction type is OPTIONAL for ALL document types.
+            # We separate matches by transaction type only for preference/ranking, not filtering.
+            # Non-matching transaction types are still kept as valid matches.
             # We'll sort by transaction_match later to prefer matching transaction types
             if not is_id_document and transaction_type:
                 # Separate matches into transaction_match=True and False
+                # This is for preference only - both groups are kept as valid matches
                 matching_transaction = [c for c in name_matches if c['transaction_match']]
                 non_matching_transaction = [c for c in name_matches if not c['transaction_match']]
                 
                 if matching_transaction:
                     logger.info(f"Stage 1: Found {len(matching_transaction)} matches with matching transaction type, {len(non_matching_transaction)} with non-matching")
                     # Prefer matches with correct transaction type, but keep others as fallback
+                    # Both groups are valid - we just prefer matching ones
                     name_matches = matching_transaction + non_matching_transaction
                 else:
                     logger.info(f"Stage 1: Found {len(name_matches)} matches but none with matching transaction type - keeping all for consideration")
@@ -1714,6 +1739,7 @@ class FirestoreService:
                 logger.info(f"Stage 1: Found {len(name_matches)} matches (ID document or no transaction type filter)")
             
             # Stage 2: Relaxed fallback if no primary matches
+            # NOTE: Transaction type remains optional - we still keep non-matching transaction types
             if not name_matches:
                 logger.debug(f"Stage 2: No matches with primary threshold {NAME_THRESHOLD_PRIMARY}, trying relaxed threshold {NAME_THRESHOLD_RELAXED}")
                 name_matches = [
@@ -1721,15 +1747,18 @@ class FirestoreService:
                     if c['name_score'] >= NAME_THRESHOLD_RELAXED
                 ]
                 
+                # Transaction type is optional for ALL document types - only used for preference
                 if not is_id_document and transaction_type:
                     matching_transaction = [c for c in name_matches if c['transaction_match']]
                     non_matching_transaction = [c for c in name_matches if not c['transaction_match']]
                     if matching_transaction:
+                        # Keep both groups - transaction type doesn't block matches
                         name_matches = matching_transaction + non_matching_transaction
                 
                 logger.info(f"Stage 2: Found {len(name_matches)} matches with relaxed threshold {NAME_THRESHOLD_RELAXED}")
             
             # Stage 3: Lenient fallback if still no matches (final attempt)
+            # NOTE: Transaction type remains optional - we still keep non-matching transaction types
             if not name_matches:
                 logger.debug(f"Stage 3: No matches with relaxed threshold {NAME_THRESHOLD_RELAXED}, trying lenient threshold {NAME_THRESHOLD_LENIENT}")
                 name_matches = [
@@ -1737,10 +1766,12 @@ class FirestoreService:
                     if c['name_score'] >= NAME_THRESHOLD_LENIENT
                 ]
                 
+                # Transaction type is optional for ALL document types - only used for preference
                 if not is_id_document and transaction_type:
                     matching_transaction = [c for c in name_matches if c['transaction_match']]
                     non_matching_transaction = [c for c in name_matches if not c['transaction_match']]
                     if matching_transaction:
+                        # Keep both groups - transaction type doesn't block matches
                         name_matches = matching_transaction + non_matching_transaction
                 
                 logger.info(f"Stage 3: Found {len(name_matches)} matches with lenient threshold {NAME_THRESHOLD_LENIENT}")
@@ -1752,41 +1783,98 @@ class FirestoreService:
                     for c in sorted(close_candidates, key=lambda x: x['name_score'], reverse=True)[:5]:  # Top 5
                         logger.debug(f"  - {c.get('id', 'unknown')}: name_score={c['name_score']:.3f}, client='{c.get('client_full_name', 'N/A')}'")
             
-            # Stage 3: Sort matches - for ID documents, prefer transaction_match but don't require it
-            if is_id_document:
-                # For ID documents: sort by name score, then transaction match (prefer matching), then property
-                name_matches.sort(
-                    key=lambda x: (
-                        x['name_score'],
-                        1.0 if x['transaction_match'] else 0.0,  # Prefer matching transaction type
-                        x.get('property_score', 0.0) if x.get('property_score') is not None else 0.0
-                    ),
-                    reverse=True
-                )
-            elif len(name_matches) > 1 and has_property_hints:
-                # For other documents: sort by name score first, then property score as tiebreaker
-                name_matches.sort(
-                    key=lambda x: (
-                        x['name_score'],
-                        x.get('property_score', 0.0) if x.get('property_score') is not None else 0.0
-                    ),
-                    reverse=True
-                )
-                # If property score is available and significant, prefer matches with property
-                # But don't filter out matches without property - just rank them lower
-            else:
-                # Sort by name score only
-                name_matches.sort(key=lambda x: x['name_score'], reverse=True)
-            
-            # Attach confidence scores
+            # Attach confidence scores first (for logging/reporting)
             for item in name_matches:
                 item['match_confidence'] = MatchingService.calculate_confidence(
                     item.get('name_score', 0.0),
                     item.get('property_score')
                 )
             
-            # Final sort by confidence (which already considers both name and property)
-            name_matches.sort(key=lambda x: x.get('match_confidence', 0.0), reverse=True)
+            # Sort matches: Client name is the PRIMARY factor
+            # Property information is only used as a tiebreaker when name scores are very close
+            # 
+            # VERIFICATION: How tuple sorting guarantees name_score is always primary:
+            # Python's tuple sorting compares element-by-element. The sort key returns:
+            #   (-name_score, tiebreaker)
+            # 
+            # This ensures:
+            # 1. name_score ALWAYS determines order when values differ (first element comparison)
+            # 2. tiebreaker (property_score) ONLY matters when name_score values are exactly equal
+            # 
+            # Example proof:
+            #   Match A: name_score=0.8, property_score=1.0  -> sort key: (-0.8, -1.0) = (-0.8, -1.0)
+            #   Match B: name_score=0.9, property_score=0.0   -> sort key: (-0.9, 1.0)  = (-0.9, 1.0)
+            #   Result: Match B ranks higher because -0.9 < -0.8 (name_score comparison)
+            #   Even though Match A has perfect property_score (1.0), it cannot override the lower name_score
+            # 
+            # Property_score range (0.0 to 1.0) can NEVER exceed name_score differences:
+            # - name_score differences are typically 0.01-0.10+ (e.g., 0.70 vs 0.80 = 0.10 difference)
+            # - property_score is always 0.0 to 1.0, and is in the SECOND tuple position
+            # - Since tuple comparison stops at first differing element, property_score never overrides name_score
+            # 
+            # The tiebreaker only matters when name_score values are exactly equal (or within floating point precision)
+            
+            def sort_key(x):
+                """Custom sort key that prioritizes name_score, using property/confidence only as tiebreaker
+                
+                VERIFICATION: Python's tuple sorting behavior:
+                - Tuples are compared element-by-element from left to right
+                - Comparison stops at the first differing element
+                - This guarantees that name_score (first element) ALWAYS determines order
+                - tiebreaker (second element) is ONLY considered when first elements are equal
+                
+                Example: (-0.8, -1.0) vs (-0.9, 1.0)
+                - First element: -0.8 vs -0.9 -> -0.8 > -0.9, so first tuple is greater
+                - Second element is never compared because first elements differ
+                - Result: Match with name_score=0.9 ranks higher, regardless of property_score
+                """
+                name_score = x.get('name_score', 0.0)
+                
+                if is_id_document:
+                    # ID documents: name_score (primary), transaction_match (secondary), property_score (tertiary)
+                    return (
+                        -name_score,  # Primary: name_score descending
+                        0.0 if x.get('transaction_match') else 1.0,  # Secondary: prefer matching transaction type
+                        -(x.get('property_score', 0.0) if x.get('property_score') is not None else 0.0)  # Tertiary: property_score
+                    )
+                else:
+                    # Other documents: name_score (primary), property_score (tiebreaker only)
+                    # IMPORTANT: When name_score is equal, prefer matches WITH property information
+                    # Matches without property_score should rank lower than matches with property_score
+                    property_score = x.get('property_score')
+                    
+                    # DEFENSIVE: Property_score range (0.0 to 1.0) can NEVER override name_score differences
+                    # - name_score differences are typically 0.01-0.10+ (e.g., 0.70 vs 0.80 = 0.10 difference)
+                    # - property_score is always in range [0.0, 1.0]
+                    # - Since property_score is in the SECOND tuple position, it only matters when name_score is equal
+                    # - This mathematical guarantee ensures property information never overrides client name matching
+                    
+                    if property_score is not None and property_score > 0:
+                        # Match has property information - use it as tiebreaker
+                        # Higher property_score = better match when name_score is equal
+                        # We negate it so higher scores rank first (descending order)
+                        # Range: property_score in [0.0, 1.0] -> tiebreaker in [-1.0, 0.0]
+                        tiebreaker = -property_score
+                    else:
+                        # Match has no property information - use very high value
+                        # so matches with property information rank higher when name_score is equal
+                        # Using 1.0 ensures any match with property_score (even 0.01) ranks higher
+                        # This value (1.0) is always greater than any negated property_score (-1.0 to 0.0)
+                        tiebreaker = 1.0
+                    
+                    # VERIFICATION: Return tuple ensures name_score is always primary
+                    # - First element (-name_score): Determines order when name_score differs
+                    # - Second element (tiebreaker): Only considered when name_score values are equal
+                    # - Python's tuple comparison guarantees this behavior
+                    return (
+                        -name_score,  # Primary: name_score descending (higher name_score = lower negative = ranks first)
+                        tiebreaker  # Secondary: property_score as tiebreaker (lower tiebreaker = ranks first)
+                        # For matches with property: tiebreaker = -property_score (higher property = lower tiebreaker = ranks first)
+                        # For matches without property: tiebreaker = 1.0 (always ranks after matches with property)
+                    )
+            
+            # Sort using the custom key
+            name_matches.sort(key=sort_key)
             
             # Determine which threshold was used (for logging)
             threshold_used = NAME_THRESHOLD_PRIMARY

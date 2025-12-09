@@ -215,13 +215,17 @@ class MatchingService:
         name_score: float,
         reference_score: Optional[float] = None
     ) -> float:
-        """Calculate overall confidence score for a match"""
+        """Calculate overall confidence score for a match.
+        
+        Client name is the primary factor (95% weight), with property information
+        used only as a minor tiebreaker (5% weight).
+        """
         if reference_score is not None:
-            # Average of name and reference scores, weighted slightly toward name
-            return (name_score * 0.6) + (reference_score * 0.4)
+            # Client name is the primary factor, property info is minor tiebreaker
+            return (name_score * 0.95) + (reference_score * 0.05)
         else:
             # Only name match available
-            return name_score * 0.8  # Slightly lower confidence without reference
+            return name_score
     
     @staticmethod
     def should_auto_attach(confidence: float, threshold: float = 0.8) -> bool:
