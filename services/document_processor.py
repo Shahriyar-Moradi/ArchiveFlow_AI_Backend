@@ -1868,9 +1868,12 @@ Return in JSON format:
             pdf_path = None
             if result['success']:
                 try:
+                    # Check both extension and actual file content to determine if it's a PDF
                     file_extension = os.path.splitext(image_path)[1].lower()
+                    actual_format = self._detect_image_format(image_path)
+                    is_pdf_file = (file_extension == '.pdf') or (actual_format == 'pdf')
                     
-                    if file_extension != '.pdf':
+                    if not is_pdf_file:
                         logger.info(f"Converting image to PDF: {image_path}")
                         pdf_path = self._convert_image_to_pdf(image_path)
                         if pdf_path:
@@ -1881,8 +1884,10 @@ Return in JSON format:
                             result['pdf_path'] = image_path
                             result['converted_to_pdf'] = False
                     else:
+                        # File is already a PDF - skip conversion
                         result['pdf_path'] = image_path
                         result['converted_to_pdf'] = False
+                        logger.info(f"File is already a PDF (format: {actual_format}, ext: {file_extension}), skipping conversion")
                 except Exception as e:
                     logger.error(f"Error during PDF conversion: {e}")
                     result['pdf_path'] = image_path
